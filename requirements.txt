@@ -1,0 +1,17 @@
+# Core numerical stack
+numpy>=1.26
+scipy>=1.11
+pandas>=2.2
+h5py>=3.10
+
+# Model generation / training utilities
+tqdm>=4.66
+
+# Torch for generation and ML workflows.
+# For Python 3.14+, install torch via conda/mamba (pip wheels may lag behind).
+torch>=2.5; python_version < "3.14"
+
+# Visualization app
+streamlit>=1.30
+plotly>=5.18
+requests>=2.31

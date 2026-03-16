@@ -69,6 +69,28 @@ def set_grid_preset(name: str) -> None:
     GRID_PRESET_NAME = name
 
 
+def load_guided_param_bank(path: str) -> np.ndarray:
+    """Load flattened guided parameter candidates from calibration output HDF5."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Guided param bank not found: {path}")
+
+    with h5py.File(p, "r") as f:
+        if "top_params" in f:
+            arr = np.array(f["top_params"], dtype=np.float64)  # (M, K, 8)
+            flat = arr.reshape(-1, arr.shape[-1])
+        elif "guided_params" in f:
+            flat = np.array(f["guided_params"], dtype=np.float64)
+        else:
+            raise KeyError("Guided bank must contain 'top_params' or 'guided_params'")
+
+    if flat.shape[1] != N_PARAMS:
+        raise ValueError(
+            f"Guided params width mismatch: expected {N_PARAMS}, got {flat.shape[1]}"
+        )
+    return flat
+
+
 #  Parameter space — Bates (SVJ) = Heston + Merton log-normal jumps
 
 PARAM_BOUNDS: np.ndarray = np.array([
@@ -161,7 +183,13 @@ def fill_nan_market_consistent(iv_chunk: torch.Tensor) -> torch.Tensor:
 
 #  Parameter sampling — scrambled Sobol (no Feller rejection)
 
-def sample_params(N: int, seed: int = 42) -> np.ndarray:
+def sample_params(
+    N: int,
+    seed: int = 42,
+    guided_bank: np.ndarray | None = None,
+    guided_weight: float = 0.0,
+    guided_jitter: float = 0.04,
+) -> np.ndarray:
     """
     Returns (N, 8) float64 Bates parameters via scrambled Sobol sequence.
 
@@ -174,23 +202,36 @@ def sample_params(N: int, seed: int = 42) -> np.ndarray:
     of samples into high-jump / negative-correlation regions.
     """
     lo, hi  = PARAM_BOUNDS[:, 0], PARAM_BOUNDS[:, 1]
+    guided_weight = float(np.clip(guided_weight, 0.0, 1.0))
+    n_guided = int(round(N * guided_weight)) if guided_bank is not None else 0
+    n_base = N - n_guided
+
     sampler = qmc.Sobol(d=N_PARAMS, scramble=True, seed=seed) # type: ignore
-    n_raw   = int(2 ** math.ceil(math.log2(int(N * 1.5))))
+    n_raw   = int(2 ** math.ceil(math.log2(max(2, int(n_base * 1.5)))))
     raw     = sampler.random(n_raw)
-    pts     = qmc.scale(raw, lo, hi)   # float64
-    pts     = pts[:N]
+    pts_base = qmc.scale(raw, lo, hi)[:n_base]   # float64
 
     # Mixture prior: dedicate a chunk of samples to stressed skew regimes.
     rng = np.random.default_rng(seed + 2026)
     stress_prob = 0.35
-    stress = rng.random(N) < stress_prob
+    stress = rng.random(n_base) < stress_prob
     n_stress = int(stress.sum())
     if n_stress > 0:
-        pts[stress, 2] = rng.uniform(0.20, 2.00, size=n_stress)    # sigma_v
-        pts[stress, 3] = rng.uniform(-0.98, -0.55, size=n_stress)   # rho
-        pts[stress, 5] = rng.uniform(1.00, 4.00, size=n_stress)     # lambda_j
-        pts[stress, 6] = rng.uniform(-0.30, -0.06, size=n_stress)   # mu_j
-        pts[stress, 7] = rng.uniform(0.10, 0.45, size=n_stress)     # sigma_j
+        pts_base[stress, 2] = rng.uniform(0.20, 2.00, size=n_stress)    # sigma_v
+        pts_base[stress, 3] = rng.uniform(-0.98, -0.55, size=n_stress)   # rho
+        pts_base[stress, 5] = rng.uniform(1.00, 4.00, size=n_stress)     # lambda_j
+        pts_base[stress, 6] = rng.uniform(-0.30, -0.06, size=n_stress)   # mu_j
+        pts_base[stress, 7] = rng.uniform(0.10, 0.45, size=n_stress)     # sigma_j
+
+    if n_guided > 0:
+        pick = rng.integers(0, len(guided_bank), size=n_guided)
+        pts_guided = guided_bank[pick].copy()
+        widths = (hi - lo)[None, :]
+        pts_guided += rng.normal(0.0, guided_jitter, size=pts_guided.shape) * widths
+        pts_guided = np.clip(pts_guided, lo, hi)
+        pts = np.concatenate([pts_base, pts_guided], axis=0)
+    else:
+        pts = pts_base
 
     κ, θ, σ = pts[:, 0], pts[:, 1], pts[:, 2]
     feller_pct = ((2.0 * κ * θ) >= σ**2).mean() * 100
@@ -198,7 +239,8 @@ def sample_params(N: int, seed: int = 42) -> np.ndarray:
     print(
         f"[sample] Sobol draws: {n_raw:,}  |  "
         f"Feller pass: {feller_pct:.1f}% (not filtered)  |  "
-        f"stress regime: {100.0 * n_stress / N:.1f}%  |  keeping: {N:,}"
+        f"stress regime: {100.0 * n_stress / max(1, n_base):.1f}% (base)  |  "
+        f"guided mix: {100.0 * n_guided / max(1, N):.1f}%  |  keeping: {N:,}"
     )
     return pts   # (N, 8) float64
 
@@ -514,6 +556,9 @@ def generate(
     chunk_size:  int   = CHUNK,
     seed:        int   = 42,
     nan_policy:  str   = "market_consistent",
+    guided_bank_path: str | None = None,
+    guided_weight: float = 0.0,
+    guided_jitter: float = 0.04,
 ) -> None:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {dev}" + (
@@ -522,7 +567,20 @@ def generate(
 
     sanity_check(dev)
 
-    params_np = sample_params(N, seed=seed)                      # (N, 8) float64
+    guided_bank = load_guided_param_bank(guided_bank_path) if guided_bank_path else None
+    if guided_bank is not None:
+        print(
+            f"[guided] bank={guided_bank_path}  rows={len(guided_bank):,}  "
+            f"weight={guided_weight:.2f}  jitter={guided_jitter:.3f}"
+        )
+
+    params_np = sample_params(
+        N,
+        seed=seed,
+        guided_bank=guided_bank,
+        guided_weight=guided_weight,
+        guided_jitter=guided_jitter,
+    )
     K_grid_np = S0 * np.exp(LOG_MONEYNESS)                       # (NK,)  float64
     K_grid    = torch.tensor(K_grid_np, device=dev, dtype=torch.float64)
     k_idx     = torch.arange(N_COS, device=dev)
@@ -542,6 +600,9 @@ def generate(
 
         f.attrs["model_type"]    = "bates"
         f.attrs["nan_policy"]    = nan_policy
+        f.attrs["guided_bank"]   = guided_bank_path if guided_bank_path else ""
+        f.attrs["guided_weight"] = guided_weight
+        f.attrs["guided_jitter"] = guided_jitter
         f.attrs["grid_preset"]   = GRID_PRESET_NAME
         f.attrs["param_names"]   = PARAM_NAMES
         f.attrs["log_moneyness"] = LOG_MONEYNESS.tolist()
@@ -740,7 +801,7 @@ if __name__ == "__main__":
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--N",     type=int,   default=2_000_000)
-    ap.add_argument("--out",   type=str,   default="heston_train.h5")
+    ap.add_argument("--out",   type=str,   default="../data/heston_train.h5")
     ap.add_argument("--seed",  type=int,   default=42)
     ap.add_argument("--chunk", type=int,   default=CHUNK,
                     help=f"GPU batch size (default {CHUNK}; f64 uses 2x VRAM vs f32)")
@@ -751,6 +812,12 @@ if __name__ == "__main__":
     ap.add_argument("--nan-policy", type=str, default="market_consistent",
                     choices=["market_consistent", "mask", "floor"],
                     help="How to handle non-invertible IV cells")
+    ap.add_argument("--guided-bank", type=str, default=None,
+                    help="HDF5 file with calibrated guided params (top_params/guided_params)")
+    ap.add_argument("--guided-weight", type=float, default=0.0,
+                    help="Fraction of samples drawn from guided param bank")
+    ap.add_argument("--guided-jitter", type=float, default=0.04,
+                    help="Relative jitter scale applied to guided params")
     ap.add_argument("--val",   action="store_true",
                     help="200k val set (seed+9999, appends _val.h5)")
     ap.add_argument("--check", action="store_true",
@@ -769,7 +836,13 @@ if __name__ == "__main__":
     elif args.val:
         out = args.out.replace(".h5", "") + "_val.h5"
         generate(N=200_000, output_path=out, seed=args.seed + 9999,
-                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy)
+                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy,
+                 guided_bank_path=args.guided_bank,
+                 guided_weight=args.guided_weight,
+                 guided_jitter=args.guided_jitter)
     else:
         generate(N=args.N, output_path=args.out, seed=args.seed,
-                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy)
+                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy,
+                 guided_bank_path=args.guided_bank,
+                 guided_weight=args.guided_weight,
+                 guided_jitter=args.guided_jitter)

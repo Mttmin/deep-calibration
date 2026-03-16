@@ -1,7 +1,0 @@
-streamlit>=1.30
-plotly>=5.18
-numpy
-h5py
-requests
-scipy
-pandas

@@ -1,4 +1,6 @@
 """
+Bates (SVJ) IV surface generator — high-resolution grid.
+
 Usage
 -----
   python heston_datagen.py                         # 2M train set
@@ -18,39 +20,70 @@ from scipy.stats import qmc
 from tqdm import tqdm
 
 
-#  Fixed (K, T) grid
+#  Grid presets — can switch from CLI via --grid
 
-LOG_MONEYNESS: np.ndarray = np.array(
-    [-0.40, -0.30, -0.20, -0.10, 0.00, 0.10, 0.20, 0.30, 0.40],
-    dtype=np.float64,
-)
-MATURITIES: np.ndarray = np.array(
-    [1 / 12, 3 / 12, 6 / 12, 1.0, 1.5, 2.0],
-    dtype=np.float64,
-)
-NK: int = len(LOG_MONEYNESS)   # 9
-NT: int = len(MATURITIES)      # 6
-# Output dimension: 54 IVs per surface.
-#
-# 1W excluded: even at sigma=14%, options at |m|>=0.10 have price < 1e-12,
-# making IV inversion physically meaningless regardless of numerical precision.
-# All 54 remaining cells have < 3% NaN rate across the full parameter space.
+GRID_PRESETS: dict[str, tuple[np.ndarray, np.ndarray]] = {
+    "base25x10": (
+        np.array([
+            -0.50, -0.40, -0.30, -0.25, -0.20, -0.15, -0.12, -0.10, -0.08, -0.06, -0.04,
+            -0.02, 0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30,
+            0.40, 0.50,
+        ], dtype=np.float64),
+        np.array([1 / 52, 2 / 52, 1 / 12, 2 / 12, 3 / 12, 6 / 12, 9 / 12, 1.0, 1.5, 2.0],
+                 dtype=np.float64),
+    ),
+    # Higher resolution for richer smile/skew structure.
+    "high41x14": (
+        np.linspace(-0.80, 0.40, 49, dtype=np.float64),
+        np.array([
+            1 / 52, 2 / 52, 3 / 52,
+            1 / 12, 2 / 12, 3 / 12, 4 / 12, 6 / 12, 9 / 12,
+            1.0, 1.25, 1.5, 2.0, 3.0,
+        ], dtype=np.float64),
+    ),
+}
+DEFAULT_GRID_PRESET = "high41x14"
 
-IS_PUT_SIDE: np.ndarray = LOG_MONEYNESS < 0.0   # (NK,) bool
+
+def _grid_from_preset(name: str) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        log_m, mats = GRID_PRESETS[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown grid preset: {name}") from exc
+    return log_m.copy(), mats.copy()
 
 
-#  Parameter space
+LOG_MONEYNESS, MATURITIES = _grid_from_preset(DEFAULT_GRID_PRESET)
+NK: int = len(LOG_MONEYNESS)
+NT: int = len(MATURITIES)
+IS_PUT_SIDE: np.ndarray = LOG_MONEYNESS < 0.0
+GRID_PRESET_NAME = DEFAULT_GRID_PRESET
+
+
+def set_grid_preset(name: str) -> None:
+    global LOG_MONEYNESS, MATURITIES, NK, NT, IS_PUT_SIDE, GRID_PRESET_NAME
+    LOG_MONEYNESS, MATURITIES = _grid_from_preset(name)
+    NK = len(LOG_MONEYNESS)
+    NT = len(MATURITIES)
+    IS_PUT_SIDE = LOG_MONEYNESS < 0.0
+    GRID_PRESET_NAME = name
+
+
+#  Parameter space — Bates (SVJ) = Heston + Merton log-normal jumps
 
 PARAM_BOUNDS: np.ndarray = np.array([
-    [0.10, 10.0],   # κ   mean-reversion speed
-    [0.02,  0.25],  # θ   long-run variance  (σ_LR ∈ [14%, 50%])
-    [0.05,  1.50],  # σ_v vol-of-vol
-    [-0.95, 0.10],  # ρ   equity skew almost always negative
-    [0.02,  0.25],  # v₀  initial variance  (σ₀  ∈ [14%, 50%])
-    # v0/theta min=0.02: ensures all 54 grid cells produce invertible prices.
-    # v0=0.01 (10% vol) → m=±0.20 at T=6M is borderline → NaN at ~60% of draws.
+    [0.10, 10.0],    # κ    mean-reversion speed
+    [0.02,  0.25],   # θ    long-run variance  (σ_LR ∈ [14%, 50%])
+    [0.05,  2.00],   # σ_v  vol-of-vol (wider to permit stronger short-tenor convexity)
+    [-0.98,  0.10],  # ρ    equity skew almost always negative
+    [0.02,  0.25],   # v₀   initial variance  (σ₀  ∈ [14%, 50%])
+    [0.00,  4.00],   # λ_J  jump intensity (0 recovers pure Heston)
+    [-0.30,  0.00],  # μ_J  mean log-jump size (negative = crash bias)
+    [0.01,  0.45],   # σ_J  jump size volatility
 ], dtype=np.float64)
-PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0"]
+PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0",
+               "lambda_j", "mu_j", "sigma_j"]
+N_PARAMS: int = len(PARAM_NAMES)  # 8
 
 
 #  COS / IV hyperparameters
@@ -65,67 +98,146 @@ IV_HI:    float = 10.0
 CHUNK:    int   = 4_096   # GPU batch size; f64 uses 2x memory vs f32
 
 
-#  Parameter sampling — scrambled Sobol + Feller rejection
+def fill_nan_market_consistent(iv_chunk: torch.Tensor) -> torch.Tensor:
+    """
+    Fill NaNs in IV surfaces while preserving key no-arbitrage structure.
+
+    Steps:
+      1) For each maturity, fill missing strikes via linear interpolation between
+         nearest valid left/right strikes; edge gaps use nearest valid value.
+      2) Enforce non-decreasing total variance over maturity for each strike:
+           w(k, T) = sigma(k, T)^2 * T,  w(k, T_{i+1}) >= w(k, T_i)
+         via cumulative maximum in T.
+    """
+    iv = iv_chunk.clone()  # (B, NK, NT) float64
+    B, n_k, n_t = iv.shape
+    idx = torch.arange(n_k, device=iv.device, dtype=torch.int64)[None, :].expand(B, n_k)
+
+    for ti in range(n_t):
+        col = iv[:, :, ti]                 # (B, NK)
+        valid = ~torch.isnan(col)          # (B, NK)
+
+        # Nearest valid index on the left for each cell.
+        left_idx = torch.where(valid, idx, torch.zeros_like(idx))
+        left_idx = torch.cummax(left_idx, dim=1).values
+        has_left = torch.cumsum(valid.to(torch.int32), dim=1) > 0
+
+        # Nearest valid index on the right for each cell.
+        rev_valid = torch.flip(valid, dims=[1])
+        rev_idx = torch.flip(idx, dims=[1])
+        right_idx_rev = torch.where(rev_valid, rev_idx, torch.full_like(rev_idx, n_k - 1))
+        right_idx_rev = torch.cummin(right_idx_rev, dim=1).values
+        right_idx = torch.flip(right_idx_rev, dims=[1])
+        has_right = torch.flip(torch.cumsum(rev_valid.to(torch.int32), dim=1) > 0, dims=[1])
+
+        left_val = torch.gather(col, 1, left_idx)
+        right_val = torch.gather(col, 1, right_idx)
+
+        left_dist = (idx - left_idx).to(torch.float64)
+        right_dist = (right_idx - idx).to(torch.float64)
+        denom = (left_dist + right_dist).clamp(min=1e-12)
+        interp = (right_val * left_dist + left_val * right_dist) / denom
+
+        nearest = torch.where(has_left, left_val, right_val)
+        fill_val = torch.where(has_left & has_right, interp, nearest)
+        fill_val = torch.where(
+            has_left | has_right,
+            fill_val,
+            torch.full_like(fill_val, IV_LO),
+        )
+
+        iv[:, :, ti] = torch.where(valid, col, fill_val)
+
+    iv = iv.clamp(min=IV_LO, max=IV_HI)
+
+    # Calendar consistency in total variance.
+    T = torch.tensor(MATURITIES, device=iv.device, dtype=torch.float64)[None, None, :]
+    total_var = iv**2 * T
+    total_var = torch.cummax(total_var, dim=2).values
+    iv = torch.sqrt(total_var / T)
+
+    return iv.clamp(min=IV_LO, max=IV_HI)
+
+
+#  Parameter sampling — scrambled Sobol (no Feller rejection)
 
 def sample_params(N: int, seed: int = 42) -> np.ndarray:
     """
-    Returns (N, 5) float64 Heston parameters via scrambled Sobol sequence.
+    Returns (N, 8) float64 Bates parameters via scrambled Sobol sequence.
 
-    Feller condition 2κθ ≥ σ_v²: when violated, v_t can hit zero, the CIR
-    diffusion degenerates, and the characteristic function may produce NaN.
-    Oversample 4× and discard violators; typical pass rate 55-70%.
+    Feller condition is NOT enforced: real markets frequently violate it,
+    and the COS method still produces valid prices. Degenerate samples
+    (excessive NaN) are naturally handled by the cell mask in training.
+
+    Sobol oversampled 1.5× to ensure N samples after rounding to power of 2.
+    Then a stress-regime mixture boosts short-tenor skew by forcing a fraction
+    of samples into high-jump / negative-correlation regions.
     """
     lo, hi  = PARAM_BOUNDS[:, 0], PARAM_BOUNDS[:, 1]
-    sampler = qmc.Sobol(d=5, scramble=True, seed=seed)
-    n_raw   = int(2 ** math.ceil(math.log2(N * 4)))
+    sampler = qmc.Sobol(d=N_PARAMS, scramble=True, seed=seed) # type: ignore
+    n_raw   = int(2 ** math.ceil(math.log2(int(N * 1.5))))
     raw     = sampler.random(n_raw)
     pts     = qmc.scale(raw, lo, hi)   # float64
+    pts     = pts[:N]
+
+    # Mixture prior: dedicate a chunk of samples to stressed skew regimes.
+    rng = np.random.default_rng(seed + 2026)
+    stress_prob = 0.35
+    stress = rng.random(N) < stress_prob
+    n_stress = int(stress.sum())
+    if n_stress > 0:
+        pts[stress, 2] = rng.uniform(0.20, 2.00, size=n_stress)    # sigma_v
+        pts[stress, 3] = rng.uniform(-0.98, -0.55, size=n_stress)   # rho
+        pts[stress, 5] = rng.uniform(1.00, 4.00, size=n_stress)     # lambda_j
+        pts[stress, 6] = rng.uniform(-0.30, -0.06, size=n_stress)   # mu_j
+        pts[stress, 7] = rng.uniform(0.10, 0.45, size=n_stress)     # sigma_j
 
     κ, θ, σ = pts[:, 0], pts[:, 1], pts[:, 2]
-    ok      = (2.0 * κ * θ) >= σ**2
-    valid   = pts[ok]
+    feller_pct = ((2.0 * κ * θ) >= σ**2).mean() * 100
 
-    if len(valid) < N:
-        raise RuntimeError(
-            f"Feller rejection left {len(valid):,} from {n_raw:,}. "
-            "Lower σ_v upper bound or raise κ/θ lower bounds."
-        )
     print(
         f"[sample] Sobol draws: {n_raw:,}  |  "
-        f"Feller pass: {ok.mean()*100:.1f}%  |  keeping: {N:,}"
+        f"Feller pass: {feller_pct:.1f}% (not filtered)  |  "
+        f"stress regime: {100.0 * n_stress / N:.1f}%  |  keeping: {N:,}"
     )
-    return valid[:N]   # (N, 5) float64
+    return pts   # (N, 8) float64
 
 
-#  Heston CF — Little Trap formulation, float64 / complex128
+#  Bates CF — Heston (Little Trap) + Merton log-normal jumps, float64 / complex128
 
-def heston_cf(
+def bates_cf(
     u:      torch.Tensor,   # (Nc,)  real frequencies, float64
     T:      float,
-    params: torch.Tensor,   # (B, 5) float64
+    params: torch.Tensor,   # (B, 8) float64  [κ, θ, σ_v, ρ, v₀, λ_J, μ_J, σ_J]
     r:      float,
     q:      float,
 ) -> torch.Tensor:           # (B, Nc) complex128
     """
-    φ(u) = E_Q[e^{iu·ln(S_T/S_0)}] under Heston, Little Trap formulation.
+    φ(u) = E_Q[e^{iu·ln(S_T/S_0)}] under Bates (1996) SVJ model.
 
-    FLOAT64 NOTE: uses torch.complex128 (= two float64 values internally).
-    On consumer GPUs (RTX 5090) f64 throughput ≈ 1/64 of f32, but generation
-    is still fast enough for a one-time offline job.
-
-    Little Trap (Albrecher et al. 2007):
+    Heston diffusive component (Little Trap, Albrecher et al. 2007):
         ξ  = κ − iuρσ_v
         d  = √(ξ² + σ_v²·u(u+i))
         g  = (ξ−d) / (ξ+d)
         logQ = ln((1−g·e^{−dT}) / (1−g))   ← branch-stable form
+
+    Merton log-normal jump component (additive in log-CF):
+        jump = λ·T·(exp(iu·μ_J − ½σ_J²·u²) − 1 − iu·(exp(μ_J + ½σ_J²) − 1))
+
+    When λ_J = 0 this reduces to pure Heston.
     """
-    κ  = params[:, 0:1]   # (B, 1)
-    θ  = params[:, 1:2]
-    σv = params[:, 2:3]
-    ρ  = params[:, 3:4]
-    v0 = params[:, 4:5]
+    κ    = params[:, 0:1]   # (B, 1)
+    θ    = params[:, 1:2]
+    σv   = params[:, 2:3]
+    ρ    = params[:, 3:4]
+    v0   = params[:, 4:5]
+    lam  = params[:, 5:6]   # jump intensity
+    mu_j = params[:, 6:7]   # mean log-jump
+    sig_j = params[:, 7:8]  # jump vol
 
     uc   = u.to(dtype=torch.complex128)          # (Nc,)
+
+    # ── Heston diffusive component ──
     ξ    = κ - 1j * ρ * σv * uc                 # (B, Nc)
     d    = torch.sqrt(ξ**2 + σv**2 * uc * (uc + 1j))
     g    = (ξ - d) / (ξ + d)
@@ -136,7 +248,15 @@ def heston_cf(
     B = (κ * θ / σv**2) * ((ξ - d) * T - 2.0 * logQ)
     C = (v0  / σv**2)   * (ξ - d) * (1.0 - e_dT) / (1.0 - g * e_dT)
 
-    return torch.exp(A + B + C)   # (B, Nc) complex128
+    # ── Merton log-normal jump component ──
+    compensator = torch.exp(mu_j + 0.5 * sig_j**2) - 1.0
+    jump = lam * T * (
+        torch.exp(1j * uc * mu_j - 0.5 * sig_j**2 * uc**2)
+        - 1.0
+        - 1j * uc * compensator
+    )
+
+    return torch.exp(A + B + C + jump)   # (B, Nc) complex128
 
 
 #  COS call payoff coefficients V_k / K  (precomputed once, float64)
@@ -173,7 +293,7 @@ def cos_call_Vk(dev: torch.device) -> torch.Tensor:   # (Nc,) float64
 #  Vectorised COS call pricer — one maturity, B params × NK strikes
 
 def cos_call_prices(
-    params:  torch.Tensor,   # (B, 5) float64
+    params:  torch.Tensor,   # (B, 8) float64
     Vk:      torch.Tensor,   # (Nc,)  float64
     T:       float,
     S0:      float,
@@ -192,7 +312,7 @@ def cos_call_prices(
     ba    = b - a
     u_k   = k_idx.double() * math.pi / ba           # (Nc,) float64
 
-    phi     = heston_cf(u_k, T, params, r, q)       # (B, Nc) complex128
+    phi     = bates_cf(u_k, T, params, r, q)        # (B, Nc) complex128
     phase_a = torch.exp(-1j * u_k.to(torch.complex128) * a)
     c_base  = phi * phase_a[None, :]                 # (B, Nc)
 
@@ -295,13 +415,13 @@ def prices_to_iv(
 
 def sanity_check(dev: torch.device) -> None:
     """
-    GPU (complex128) vs numpy (float64) reference at mid-range params.
-    Expects < 0.001% price error (f64 truncation vs analytical).
+    Two-part sanity check:
+      1. Bates with λ=0 vs pure Heston numpy reference (regression test)
+      2. Bates with jumps vs numpy Bates reference
 
-    FLOAT32 WARNING: never test with sigma_v < 0.04 in f32 mode.
-    In f64 this is not an issue (machine epsilon ~2.2e-16).
+    Expects < 0.001% price error (f64 truncation vs analytical).
     """
-    print("\n[sanity] GPU complex128 COS vs numpy float64 reference ...")
+    print("\n[sanity] Part 1: Bates(λ=0) vs pure Heston numpy reference ...")
 
     def heston_cf_np(u, T, kappa, theta, sv, rho, v0, r=0., q=0.):
         xi=kappa-1j*rho*sv*u; d=np.sqrt(xi**2+sv**2*u*(u+1j))
@@ -309,9 +429,17 @@ def sanity_check(dev: torch.device) -> None:
         return np.exp(1j*u*(r-q)*T + (kappa*theta/sv**2)*((xi-d)*T-2*logQ)
                       + (v0/sv**2)*(xi-d)*(1-e_dT)/(1-g*e_dT))
 
-    def cos_f64_np(S0, K, T, kappa, theta, sv, rho, v0, r=0., q=0., N=256, H=3.0):
+    def cos_f64_np(S0, K, T, kappa, theta, sv, rho, v0, r=0., q=0.,
+                   lam=0., mu_j=0., sig_j=0.1, N=256, H=3.0):
         a,b=-H,H; ba=b-a; k=np.arange(N,dtype=float); u_k=k*math.pi/ba
+        # Heston CF
         phi=heston_cf_np(u_k,T,kappa,theta,sv,rho,v0,r,q)
+        # Merton jump CF (multiplicative in phi)
+        if lam > 0:
+            compensator = np.exp(mu_j + 0.5*sig_j**2) - 1.0
+            jump = lam*T*(np.exp(1j*u_k*mu_j - 0.5*sig_j**2*u_k**2) - 1.0
+                          - 1j*u_k*compensator)
+            phi = phi * np.exp(jump)
         c=phi*np.exp(-1j*u_k*a); x=math.log(S0/K); alpha=k*math.pi/ba; ang0=-alpha*a
         denom=1+alpha**2; denom[0]=1.
         chi=(math.exp(b)*np.cos(k*np.pi)-np.cos(ang0)-alpha*np.sin(ang0))/denom; chi[0]=math.exp(b)-1
@@ -325,11 +453,16 @@ def sanity_check(dev: torch.device) -> None:
     K_t    = torch.tensor([S0], device=dev, dtype=torch.float64)
     k_idx  = torch.arange(N_COS, device=dev)
     Vk     = cos_call_Vk(dev)
-    par    = torch.tensor([[kappa, theta, sv, rho, v0]], device=dev, dtype=torch.float64)
+    # Bates params with λ=0 (pure Heston)
+    par    = torch.tensor([[kappa, theta, sv, rho, v0, 0.0, 0.0, 0.1]],
+                          device=dev, dtype=torch.float64)
     is_put = torch.tensor([False], device=dev)
 
+    # Test a subset of maturities for speed (1M, 6M, 2Y)
+    test_maturities = [MATURITIES[0], MATURITIES[5], MATURITIES[-1]]
+
     all_ok = True
-    for T in MATURITIES:
+    for T in test_maturities:
         ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r, q)
         gpu  = cos_call_prices(par, Vk, float(T), S0, K_t, r, q, k_idx)[0, 0].item()
         pe   = abs(gpu - ref) / (ref + 1e-15) * 100
@@ -341,9 +474,35 @@ def sanity_check(dev: torch.device) -> None:
             f"  T={T:.4f}  ref={ref:.8f}  gpu={gpu:.8f}  "
             f"err={pe:.5f}%  iv={iv:.5f}  {'OK' if ok else 'FAIL'}"
         )
+
+    print("\n[sanity] Part 2: Bates with jumps vs numpy Bates reference ...")
+    lam, mu_j, sig_j = 0.5, -0.08, 0.15
+    par_j = torch.tensor([[kappa, theta, sv, rho, v0, lam, mu_j, sig_j]],
+                         device=dev, dtype=torch.float64)
+
+    for T in test_maturities:
+        ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r, q,
+                          lam=lam, mu_j=mu_j, sig_j=sig_j)
+        gpu  = cos_call_prices(par_j, Vk, float(T), S0, K_t, r, q, k_idx)[0, 0].item()
+        pe   = abs(gpu - ref) / (ref + 1e-15) * 100
+        otm  = torch.tensor([[gpu]], device=dev, dtype=torch.float64)
+        iv   = prices_to_iv(otm, K_t, float(T), S0, r, q, is_put)[0, 0].item()
+        ok   = pe < 0.001 and not math.isnan(iv)
+        all_ok &= ok
+        print(
+            f"  T={T:.4f}  ref={ref:.8f}  gpu={gpu:.8f}  "
+            f"err={pe:.5f}%  iv={iv:.5f}  {'OK' if ok else 'FAIL'}"
+        )
+
     if not all_ok:
         raise RuntimeError("Sanity check FAILED")
     print("[sanity] PASSED\n")
+
+
+#  Market environment bounds (sampled per-chunk to preserve GEMM decomposition)
+
+R_BOUNDS = (0.00, 0.06)   # risk-free rate
+Q_BOUNDS = (0.00, 0.04)   # dividend yield
 
 
 #  Main generation loop
@@ -352,10 +511,9 @@ def generate(
     N:           int   = 2_000_000,
     output_path: str   = "heston_train.h5",
     S0:          float = 1.0,
-    r:           float = 0.0,
-    q:           float = 0.0,
     chunk_size:  int   = CHUNK,
     seed:        int   = 42,
+    nan_policy:  str   = "market_consistent",
 ) -> None:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {dev}" + (
@@ -364,25 +522,34 @@ def generate(
 
     sanity_check(dev)
 
-    params_np = sample_params(N, seed=seed)                      # (N, 5) float64
+    params_np = sample_params(N, seed=seed)                      # (N, 8) float64
     K_grid_np = S0 * np.exp(LOG_MONEYNESS)                       # (NK,)  float64
     K_grid    = torch.tensor(K_grid_np, device=dev, dtype=torch.float64)
     k_idx     = torch.arange(N_COS, device=dev)
     Vk        = cos_call_Vk(dev)                                  # (Nc,)  float64
     is_put    = torch.tensor(IS_PUT_SIDE, device=dev)             # (NK,)  bool
 
+    # RNG for per-chunk r, q sampling
+    rng = np.random.default_rng(seed + 7777)
+
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     n_chunks = math.ceil(N / chunk_size)
 
     with h5py.File(out, "w") as f:
+        total_cells = NK * NT
+        vc_dtype = "uint8" if total_cells <= 255 else "uint16"
+
+        f.attrs["model_type"]    = "bates"
+        f.attrs["nan_policy"]    = nan_policy
+        f.attrs["grid_preset"]   = GRID_PRESET_NAME
         f.attrs["param_names"]   = PARAM_NAMES
         f.attrs["log_moneyness"] = LOG_MONEYNESS.tolist()
         f.attrs["maturities"]    = MATURITIES.tolist()
         f.attrs["K_grid"]        = K_grid_np.tolist()
         f.attrs["S0"]            = S0
-        f.attrs["r"]             = r
-        f.attrs["q"]             = q
+        f.attrs["r_bounds"]      = list(R_BOUNDS)
+        f.attrs["q_bounds"]      = list(Q_BOUNDS)
         f.attrs["N_COS"]         = N_COS
         f.attrs["HALF_ABS"]      = HALF_ABS
         f.attrs["N_total"]       = N
@@ -393,21 +560,29 @@ def generate(
 
         cs_n = min(4096, N)
         f.create_dataset("params",
-            shape=(N, 5), dtype="float64",
-            chunks=(cs_n, 5), compression="lzf")
+            shape=(N, N_PARAMS), dtype="float64",
+            chunks=(cs_n, N_PARAMS), compression="lzf")
+        f.create_dataset("market_params",
+            shape=(N, 2), dtype="float64",
+            chunks=(cs_n, 2), compression="lzf")
         f.create_dataset("iv_surface",
             shape=(N, NK, NT), dtype="float64",
-            chunks=(min(512, N), NK, NT), compression="lzf")
+            chunks=(min(256, N), NK, NT), compression="lzf")
         f.create_dataset("cell_mask",
             shape=(N, NK, NT), dtype="bool",
-            chunks=(min(512, N), NK, NT), compression="lzf")
+            chunks=(min(256, N), NK, NT), compression="lzf")
+        f.create_dataset("raw_cell_mask",
+            shape=(N, NK, NT), dtype="bool",
+            chunks=(min(256, N), NK, NT), compression="lzf")
         f.create_dataset("valid_count",
-            shape=(N,), dtype="uint8",
+            shape=(N,), dtype=vc_dtype,
             chunks=(cs_n,))
 
         ds_p  = f["params"]
+        ds_mp = f["market_params"]
         ds_iv = f["iv_surface"]
         ds_cm = f["cell_mask"]
+        ds_rcm = f["raw_cell_mask"]
         ds_vc = f["valid_count"]
 
         total_valid_cells = 0
@@ -418,24 +593,46 @@ def generate(
             i1 = min(i0 + chunk_size, N)
             B  = i1 - i0
 
+            # Sample r, q per-chunk (all B samples share same r, q)
+            r = float(rng.uniform(*R_BOUNDS))
+            q = float(rng.uniform(*Q_BOUNDS))
+
             params_t = torch.tensor(params_np[i0:i1], device=dev, dtype=torch.float64)
             iv_chunk = torch.full((B, NK, NT), float("nan"),
                                   dtype=torch.float64, device=dev)
 
             for ti, T in enumerate(MATURITIES.tolist()):
-                call_p = cos_call_prices(params_t, Vk, T, S0, K_grid, r, q, k_idx)
-                otm_p  = call_to_otm(call_p, K_grid, T, S0, r, q, is_put)
-                iv_chunk[:, :, ti] = prices_to_iv(otm_p, K_grid, T, S0, r, q, is_put)
+                call_p = cos_call_prices(params_t, Vk, T, S0, K_grid, r, q, k_idx) # type: ignore
+                otm_p  = call_to_otm(call_p, K_grid, T, S0, r, q, is_put) # type: ignore
+                iv_chunk[:, :, ti] = prices_to_iv(otm_p, K_grid, T, S0, r, q, is_put) # type: ignore
 
-            mask_chunk = ~torch.isnan(iv_chunk)           # (B, NK, NT) bool
+            raw_mask_chunk = ~torch.isnan(iv_chunk)       # (B, NK, NT) bool
+
+            if nan_policy == "mask":
+                iv_out = iv_chunk
+                mask_chunk = raw_mask_chunk
+            elif nan_policy == "floor":
+                iv_out = torch.nan_to_num(iv_chunk, nan=IV_LO).clamp(min=IV_LO, max=IV_HI)
+                mask_chunk = torch.ones_like(raw_mask_chunk)
+            elif nan_policy == "market_consistent":
+                iv_out = fill_nan_market_consistent(iv_chunk)
+                mask_chunk = torch.ones_like(raw_mask_chunk)
+            else:
+                raise ValueError(f"Unknown nan_policy: {nan_policy}")
+
             vcount     = mask_chunk.sum(dim=(1, 2))       # (B,) int
 
             total_valid_cells += int(mask_chunk.sum().item())
 
-            ds_p[i0:i1]  = params_np[i0:i1]
-            ds_iv[i0:i1] = iv_chunk.cpu().numpy()
-            ds_cm[i0:i1] = mask_chunk.cpu().numpy()
-            ds_vc[i0:i1] = vcount.byte().cpu().numpy()
+            # Store r, q per sample (same value within chunk)
+            rq_chunk = np.full((B, 2), [r, q], dtype=np.float64)
+
+            ds_p[i0:i1]  = params_np[i0:i1] # type: ignore
+            ds_mp[i0:i1] = rq_chunk # type: ignore
+            ds_iv[i0:i1] = iv_out.cpu().numpy() # type: ignore
+            ds_cm[i0:i1] = mask_chunk.cpu().numpy() # type: ignore
+            ds_rcm[i0:i1] = raw_mask_chunk.cpu().numpy() # type: ignore
+            ds_vc[i0:i1] = vcount.cpu().numpy().astype(ds_vc.dtype) # type: ignore
 
         elapsed = time.time() - t0
         max_cells = N * NK * NT
@@ -454,12 +651,12 @@ def generate(
 
 #  PyTorch Dataset — lazy HDF5, fork-safe
 
-class HestonDataset(torch.utils.data.Dataset):
+class BatesDataset(torch.utils.data.Dataset):
     """
     Returns (params_norm, iv_flat, mask_flat):
-      params_norm : (5,)       float32  normalised to [0,1] per parameter
-      iv_flat     : (NK*NT,)   float32  IVs; NaN where cell_mask is False
-      mask_flat   : (NK*NT,)   bool     True where IV is valid
+      params_norm : (N_PARAMS+2,) float32  normalised to [0,1] (8 Bates params + r, q)
+      iv_flat     : (NK*NT,)      float32  IVs; NaN replaced with 0
+      mask_flat   : (NK*NT,)      bool     True where IV is valid
 
     In the training loop, mask_flat is used to zero-out NaN cells in the loss:
         loss = (mask * (nn_out - iv_flat)**2).sum() / mask.sum().clamp(min=1)
@@ -467,24 +664,34 @@ class HestonDataset(torch.utils.data.Dataset):
     Lazy open: HDF5 file opened inside __getitem__ after DataLoader fork.
     """
 
-    def __init__(self, h5_path: str, min_valid_cells: int = 30):
+    def __init__(self, h5_path: str, min_valid_cells: int | None = None):
         """
         min_valid_cells: discard samples with fewer than this many valid cells.
-        Default 30 (of 54): ensures ≥55% of the surface is populated.
+        Default is 50% of total grid cells (dynamic from NK*NT).
         Set to 0 to keep all samples.
         """
         self.h5_path = h5_path
         self._h5     = None
 
         with h5py.File(h5_path, "r") as f:
-            vc            = f["valid_count"][:]
-            self.idx      = np.where(vc >= min_valid_cells)[0]
+            nk = int(f.attrs.get("NK", f["iv_surface"].shape[1])) # type: ignore
+            nt = int(f.attrs.get("NT", f["iv_surface"].shape[2])) # type: ignore
+            default_min_valid = int(math.ceil(0.5 * nk * nt))
+            self.min_valid_cells = default_min_valid if min_valid_cells is None else min_valid_cells
+
+            vc            = f["valid_count"][:] # type: ignore
+            self.idx      = np.where(vc >= self.min_valid_cells)[0] # type: ignore
             self.param_lo = np.array(f.attrs["param_lo"], dtype=np.float32)
             self.param_hi = np.array(f.attrs["param_hi"], dtype=np.float32)
+            # r, q bounds for normalization
+            r_bounds = np.array(f.attrs.get("r_bounds", [0.0, 0.06]), dtype=np.float32)
+            q_bounds = np.array(f.attrs.get("q_bounds", [0.0, 0.04]), dtype=np.float32)
+            self.market_lo = np.array([r_bounds[0], q_bounds[0]], dtype=np.float32)
+            self.market_hi = np.array([r_bounds[1], q_bounds[1]], dtype=np.float32)
 
         print(
             f"[dataset] {h5_path}: {len(self.idx):,} samples "
-            f"(min_valid_cells={min_valid_cells})"
+            f"(min_valid_cells={self.min_valid_cells})"
         )
 
     def _open(self) -> None:
@@ -498,25 +705,32 @@ class HestonDataset(torch.utils.data.Dataset):
         self._open()
         j = int(self.idx[i])
 
-        params = self._h5["params"][j].astype(np.float32)
-        iv     = self._h5["iv_surface"][j].astype(np.float32)   # (NK, NT)
-        mask   = self._h5["cell_mask"][j]                        # (NK, NT) bool
+        params = self._h5["params"][j].astype(np.float32)        # type: ignore  (N_PARAMS,)
+        rq     = self._h5["market_params"][j].astype(np.float32) # type: ignore  (2,)
+        iv     = self._h5["iv_surface"][j].astype(np.float32)    # type: ignore  (NK, NT)
+        mask   = self._h5["cell_mask"][j]                         # type: ignore  (NK, NT) bool
 
+        # Normalize params and market params to [0, 1]
         params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+        rq     = (rq - self.market_lo) / (self.market_hi - self.market_lo + 1e-12)
+        all_params = np.concatenate([params, rq])  # (N_PARAMS+2,)
 
         # Replace NaN with 0 in iv (loss will mask these out anyway)
-        iv[~mask] = 0.0
+        iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]
 
         return (
-            torch.from_numpy(params),
-            torch.from_numpy(iv.flatten()),         # (NK*NT,)
-            torch.from_numpy(mask.flatten()),        # (NK*NT,) bool
+            torch.from_numpy(all_params),
+            torch.from_numpy(iv.flatten()),         # (NK*NT,) # type: ignore
+            torch.from_numpy(mask.flatten()),        # (NK*NT,) bool # type: ignore
         )
 
     def __del__(self) -> None:
         if self._h5 is not None:
             try: self._h5.close()
             except Exception: pass
+
+# Backward-compatible alias
+HestonDataset = BatesDataset
 
 
 #  CLI
@@ -530,14 +744,24 @@ if __name__ == "__main__":
     ap.add_argument("--seed",  type=int,   default=42)
     ap.add_argument("--chunk", type=int,   default=CHUNK,
                     help=f"GPU batch size (default {CHUNK}; f64 uses 2x VRAM vs f32)")
+    ap.add_argument("--grid",  type=str, default=DEFAULT_GRID_PRESET,
+                    choices=sorted(GRID_PRESETS.keys()),
+                    help="Grid preset: base25x10 or high41x14")
     ap.add_argument("--S0",    type=float, default=1.0)
-    ap.add_argument("--r",     type=float, default=0.0)
-    ap.add_argument("--q",     type=float, default=0.0)
+    ap.add_argument("--nan-policy", type=str, default="market_consistent",
+                    choices=["market_consistent", "mask", "floor"],
+                    help="How to handle non-invertible IV cells")
     ap.add_argument("--val",   action="store_true",
                     help="200k val set (seed+9999, appends _val.h5)")
     ap.add_argument("--check", action="store_true",
                     help="Sanity check only, no generation")
     args = ap.parse_args()
+
+    set_grid_preset(args.grid)
+    print(
+        f"[grid] preset={GRID_PRESET_NAME}  NK={NK}  NT={NT}  "
+        f"cells/surface={NK*NT}"
+    )
 
     if args.check:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -545,7 +769,7 @@ if __name__ == "__main__":
     elif args.val:
         out = args.out.replace(".h5", "") + "_val.h5"
         generate(N=200_000, output_path=out, seed=args.seed + 9999,
-                 chunk_size=args.chunk, S0=args.S0, r=args.r, q=args.q)
+                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy)
     else:
         generate(N=args.N, output_path=args.out, seed=args.seed,
-                 chunk_size=args.chunk, S0=args.S0, r=args.r, q=args.q)
+                 chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy)

@@ -41,3 +41,6 @@ documentation/
 
 # Data ignored
 *.h5
+
+# Ignore api keys and other secrets
+api_keys.json

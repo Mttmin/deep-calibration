@@ -44,3 +44,7 @@ documentation/
 
 # Ignore api keys and other secrets
 api_keys.json
+
+# env files
+.env
+.conda/

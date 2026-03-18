@@ -15,3 +15,8 @@ torch>=2.5; python_version < "3.14"
 streamlit>=1.30
 plotly>=5.18
 requests>=2.31
+
+# Model export (ONNX) and inference verification
+onnx>=1.16
+onnxscript>=0.1
+onnxruntime>=1.18

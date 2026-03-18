@@ -48,3 +48,4 @@ api_keys.json
 # env files
 .env
 .conda/
+model/runs*

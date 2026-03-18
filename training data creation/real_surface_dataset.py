@@ -170,7 +170,7 @@ def parse_chain(payload: dict) -> tuple[pd.DataFrame, float, str]:
     api_date = str(meta.get("date", ""))
 
     if underlying <= 0 and df["open_interest"].sum() > 0:
-        underlying = float(df.loc[df["open_interest"].idxmax(), "strike"])
+        underlying = float(df.loc[df["open_interest"].idxmax(), "strike"]) # type: ignore
 
     return df, underlying, api_date
 
@@ -215,6 +215,13 @@ def build_surface(
     iv_linear = griddata(points, iv_values, (grid_m, grid_t), method="linear")
     iv_nearest = griddata(points, iv_values, (grid_m, grid_t), method="nearest")
     iv_filled = np.where(np.isfinite(iv_linear), iv_linear, iv_nearest)
+    iv_filled = np.clip(iv_filled, 0.01, 3.0)
+
+    # Calendar-consistency: enforce non-decreasing total variance in T (same rule as heston_datagen)
+    T_arr = maturities[None, :]                                     # (1, NT)
+    total_var = iv_filled**2 * T_arr                                # (NK, NT)
+    total_var = np.maximum.accumulate(total_var, axis=1)            # cummax along T
+    iv_filled = np.sqrt(np.maximum(total_var / T_arr, 1e-12))
     iv_filled = np.clip(iv_filled, 0.01, 3.0)
 
     raw_mask = np.isfinite(iv_linear)

@@ -70,7 +70,12 @@ def set_grid_preset(name: str) -> None:
 
 
 def load_guided_param_bank(path: str) -> np.ndarray:
-    """Load flattened guided parameter candidates from calibration output HDF5."""
+    """
+    Load flattened guided parameter candidates from calibration output HDF5.
+
+    When top_weighted_rmse is present, filters to candidates with RMSE ≤ median
+    to exclude low-quality fits that would corrupt guided warm-start sampling.
+    """
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Guided param bank not found: {path}")
@@ -79,6 +84,14 @@ def load_guided_param_bank(path: str) -> np.ndarray:
         if "top_params" in f:
             arr = np.array(f["top_params"], dtype=np.float64)  # (M, K, 8)
             flat = arr.reshape(-1, arr.shape[-1])
+            # Filter to best half by RMSE when scores are available
+            if "top_weighted_rmse" in f:
+                rmse_flat = np.array(f["top_weighted_rmse"]).reshape(-1)
+                median_rmse = float(np.median(rmse_flat))
+                keep = rmse_flat <= median_rmse
+                flat = flat[keep]
+                print(f"[guided_bank] RMSE filter: kept {keep.sum():,}/{len(keep):,} "
+                      f"candidates (threshold={median_rmse:.4f})")
         elif "guided_params" in f:
             flat = np.array(f["guided_params"], dtype=np.float64)
         else:
@@ -224,8 +237,8 @@ def sample_params(
         pts_base[stress, 7] = rng.uniform(0.10, 0.45, size=n_stress)     # sigma_j
 
     if n_guided > 0:
-        pick = rng.integers(0, len(guided_bank), size=n_guided)
-        pts_guided = guided_bank[pick].copy()
+        pick = rng.integers(0, len(guided_bank), size=n_guided) # type: ignore
+        pts_guided = guided_bank[pick].copy() # type: ignore
         widths = (hi - lo)[None, :]
         pts_guided += rng.normal(0.0, guided_jitter, size=pts_guided.shape) * widths
         pts_guided = np.clip(pts_guided, lo, hi)
@@ -714,34 +727,68 @@ def generate(
 
 class BatesDataset(torch.utils.data.Dataset):
     """
-    Returns (params_norm, iv_flat, mask_flat):
+    Returns (params_norm, iv_flat, mask_flat) or, when return_confidence=True,
+    (params_norm, iv_flat, mask_flat, conf_flat):
       params_norm : (N_PARAMS+2,) float32  normalised to [0,1] (8 Bates params + r, q)
       iv_flat     : (NK*NT,)      float32  IVs; NaN replaced with 0
       mask_flat   : (NK*NT,)      bool     True where IV is valid
+      conf_flat   : (NK*NT,)      float32  per-cell confidence proxy (when requested)
+                    cells in raw_cell_mask get 1.0; filled-only cells get 0.3
 
     In the training loop, mask_flat is used to zero-out NaN cells in the loss:
         loss = (mask * (nn_out - iv_flat)**2).sum() / mask.sum().clamp(min=1)
 
-    Lazy open: HDF5 file opened inside __getitem__ after DataLoader fork.
+    Can either lazily read from HDF5 per sample or preload the selected split
+    into host RAM once during initialisation.
     """
 
-    def __init__(self, h5_path: str, min_valid_cells: int | None = None):
+    def __init__(
+        self,
+        h5_path: str,
+        min_valid_cells: int | None = None,
+        indices: np.ndarray | range | None = None,
+        preload: bool = False,
+        preload_device: str = "cpu",
+        return_confidence: bool = False,
+    ):
         """
         min_valid_cells: discard samples with fewer than this many valid cells.
         Default is 50% of total grid cells (dynamic from NK*NT).
         Set to 0 to keep all samples.
+
+        indices: optional positions within the filtered valid-sample array.
+        preload: if True, materialise the selected split into RAM once.
         """
         self.h5_path = h5_path
         self._h5     = None
+        self.preload = preload
+        self.preload_device = preload_device
+        self.return_confidence = return_confidence
+        self.params_tensor: torch.Tensor | None = None
+        self.iv_tensor: torch.Tensor | None = None
+        self.mask_tensor: torch.Tensor | None = None
+        self.conf_tensor: torch.Tensor | None = None
+
+        if self.preload_device not in {"cpu", "cuda"}:
+            raise ValueError(f"Unknown preload device: {self.preload_device}")
+        if self.preload and self.preload_device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA preload requested but CUDA is unavailable")
 
         with h5py.File(h5_path, "r") as f:
             nk = int(f.attrs.get("NK", f["iv_surface"].shape[1])) # type: ignore
             nt = int(f.attrs.get("NT", f["iv_surface"].shape[2])) # type: ignore
+            self.nk = nk
+            self.nt = nt
             default_min_valid = int(math.ceil(0.5 * nk * nt))
             self.min_valid_cells = default_min_valid if min_valid_cells is None else min_valid_cells
 
             vc            = f["valid_count"][:] # type: ignore
-            self.idx      = np.where(vc >= self.min_valid_cells)[0] # type: ignore
+            valid_idx     = np.where(vc >= self.min_valid_cells)[0] # type: ignore
+            if indices is not None:
+                split_idx = np.asarray(indices, dtype=np.int64)
+                self.idx = valid_idx[split_idx]
+            else:
+                self.idx = valid_idx
             self.param_lo = np.array(f.attrs["param_lo"], dtype=np.float32)
             self.param_hi = np.array(f.attrs["param_hi"], dtype=np.float32)
             # r, q bounds for normalization
@@ -752,8 +799,111 @@ class BatesDataset(torch.utils.data.Dataset):
 
         print(
             f"[dataset] {h5_path}: {len(self.idx):,} samples "
-            f"(min_valid_cells={self.min_valid_cells})"
+            f"(min_valid_cells={self.min_valid_cells}, "
+            f"preload={'yes' if self.preload else 'no'}:{self.preload_device})"
         )
+
+        if self.preload:
+            self._preload_into_ram()
+
+    def _estimate_preload_bytes(self) -> int:
+        n = len(self.idx)
+        n_params = len(self.param_lo) + len(self.market_lo)
+        n_flat = self.nk * self.nt
+        total = n * (n_params * 4 + n_flat * 4 + n_flat)
+        if self.return_confidence:
+            total += n * n_flat * 4
+        return total
+
+    def _preload_into_ram(self, io_threads: int = 8) -> None:
+        import concurrent.futures
+        import time as _time
+
+        est_gb = self._estimate_preload_bytes() / 1e9
+        n = len(self.idx)
+        print(
+            f"[dataset] preloading {n:,} samples (~{est_gb:.2f} GB) "
+            f"to {self.preload_device.upper()} using {io_threads} parallel reader threads …"
+        )
+
+        # Use a slice selector when indices are contiguous — orders of magnitude
+        # faster than fancy indexing inside h5py because it avoids per-element
+        # chunk lookups and lets the library do a single sequential read.
+        idx = self.idx
+        i0, i1 = 0, n   # defaults; only used when is_contiguous is True
+        if n > 0 and int(idx[-1]) - int(idx[0]) + 1 == n and (
+            n == 1 or bool(np.all(np.diff(idx) == 1))
+        ):
+            is_contiguous = True
+            i0, i1 = int(idx[0]), int(idx[-1]) + 1
+        else:
+            is_contiguous = False
+
+        h5_path = self.h5_path
+
+        def _read_slice(dsname: str, dtype: type, start: int, stop: int) -> np.ndarray:
+            with h5py.File(h5_path, "r", swmr=True) as f:
+                return np.array(f[dsname][start:stop], dtype=dtype)  # type: ignore
+
+        def _read_fancy(dsname: str, dtype: type) -> np.ndarray:
+            with h5py.File(h5_path, "r", swmr=True) as f:
+                return np.array(f[dsname][idx], dtype=dtype)  # type: ignore
+
+        t0 = _time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=io_threads) as ex:
+            if is_contiguous:
+                # Split the big iv_surface read across multiple threads;
+                # params/market_params/cell_mask are small — one thread each.
+                chunk = max(1, (i1 - i0 + io_threads - 4) // (io_threads - 3))
+                iv_futures = [
+                    ex.submit(_read_slice, "iv_surface", np.float32,
+                              s, min(s + chunk, i1))
+                    for s in range(i0, i1, chunk)
+                ]
+                f_params = ex.submit(_read_slice, "params",        np.float32, i0, i1)
+                f_rq     = ex.submit(_read_slice, "market_params", np.float32, i0, i1)
+                f_mask   = ex.submit(_read_slice, "cell_mask",     bool,       i0, i1)
+                f_raw    = ex.submit(_read_slice, "raw_cell_mask", bool,       i0, i1) if self.return_confidence else None
+                params = f_params.result()
+                rq     = f_rq.result()
+                mask   = f_mask.result()
+                raw_mask = f_raw.result() if f_raw is not None else None
+                iv     = np.concatenate([ft.result() for ft in iv_futures], axis=0)
+            else:
+                f_params = ex.submit(_read_fancy, "params",        np.float32)
+                f_rq     = ex.submit(_read_fancy, "market_params", np.float32)
+                f_iv     = ex.submit(_read_fancy, "iv_surface",    np.float32)
+                f_mask   = ex.submit(_read_fancy, "cell_mask",     bool)
+                f_raw    = ex.submit(_read_fancy, "raw_cell_mask", bool) if self.return_confidence else None
+                params = f_params.result()
+                rq     = f_rq.result()
+                iv     = f_iv.result()
+                mask   = f_mask.result()
+                raw_mask = f_raw.result() if f_raw is not None else None
+        print(f"[dataset] read done in {_time.perf_counter() - t0:.1f}s — normalising …")
+
+        params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+        rq     = (rq - self.market_lo) / (self.market_hi - self.market_lo + 1e-12)
+        all_params = np.concatenate([params, rq], axis=1)
+        iv[~mask] = 0.0
+
+        self.params_tensor = torch.from_numpy(all_params)
+        self.iv_tensor = torch.from_numpy(iv.reshape(len(self.idx), -1))
+        self.mask_tensor = torch.from_numpy(mask.reshape(len(self.idx), -1))
+        if self.return_confidence:
+            if raw_mask is None:
+                raise RuntimeError("Confidence preload requested but raw_cell_mask was not loaded")
+            conf = np.where(np.asarray(raw_mask, dtype=bool), 1.0, 0.3).astype(np.float32)
+            self.conf_tensor = torch.from_numpy(conf.reshape(len(self.idx), -1))
+
+        if self.preload_device == "cuda":
+            self.params_tensor = self.params_tensor.to("cuda", non_blocking=False)
+            self.iv_tensor = self.iv_tensor.to("cuda", non_blocking=False)
+            self.mask_tensor = self.mask_tensor.to("cuda", non_blocking=False)
+            if self.conf_tensor is not None:
+                self.conf_tensor = self.conf_tensor.to("cuda", non_blocking=False)
+
+        print(f"[dataset] preload total: {_time.perf_counter() - t0:.1f}s")
 
     def _open(self) -> None:
         if self._h5 is None:
@@ -763,6 +913,22 @@ class BatesDataset(torch.utils.data.Dataset):
         return len(self.idx)
 
     def __getitem__(self, i: int):
+        if self.params_tensor is not None and self.iv_tensor is not None and self.mask_tensor is not None:
+            if self.return_confidence:
+                if self.conf_tensor is None:
+                    raise RuntimeError("return_confidence=True but confidence tensor is missing")
+                return (
+                    self.params_tensor[i],
+                    self.iv_tensor[i],
+                    self.mask_tensor[i],
+                    self.conf_tensor[i],
+                )
+            return (
+                self.params_tensor[i],
+                self.iv_tensor[i],
+                self.mask_tensor[i],
+            )
+
         self._open()
         j = int(self.idx[i])
 
@@ -778,6 +944,17 @@ class BatesDataset(torch.utils.data.Dataset):
 
         # Replace NaN with 0 in iv (loss will mask these out anyway)
         iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]
+
+        if self.return_confidence:
+            # Confidence proxy: raw quotes get 1.0, filled-only cells get 0.3
+            raw_mask = self._h5["raw_cell_mask"][j]               # type: ignore  (NK, NT) bool
+            conf = np.where(np.asarray(raw_mask, dtype=bool), 1.0, 0.3).astype(np.float32)
+            return (
+                torch.from_numpy(all_params),
+                torch.from_numpy(iv.flatten()),         # (NK*NT,) # type: ignore
+                torch.from_numpy(mask.flatten()),        # (NK*NT,) bool # type: ignore
+                torch.from_numpy(conf.flatten()),        # (NK*NT,) float32
+            )
 
         return (
             torch.from_numpy(all_params),

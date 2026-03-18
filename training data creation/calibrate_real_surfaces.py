@@ -51,7 +51,7 @@ def sample_candidates(
     seed: int,
 ) -> np.ndarray:
     n_param = param_bounds.shape[0]
-    sampler = qmc.Sobol(d=n_param, scramble=True, seed=seed)
+    sampler = qmc.Sobol(d=n_param, scramble=True, seed=seed) # type: ignore
     n_raw = int(2 ** math.ceil(math.log2(max(2, n))))
     raw = sampler.random(n_raw)[:n]
 
@@ -188,8 +188,8 @@ def main() -> None:
 
         # Current pricer uses scalar r,q per batch; calibrate one market pair per surface.
         rng = np.random.default_rng(args.seed + 101 * int(j))
-        r_s = float(rng.uniform(*r_bounds))
-        q_s = float(rng.uniform(*q_bounds))
+        r_s = float(rng.uniform(*r_bounds)) # type: ignore
+        q_s = float(rng.uniform(*q_bounds)) # type: ignore
 
         pred = simulate_candidates(
             mod=mod,

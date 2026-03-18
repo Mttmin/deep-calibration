@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 import h5py
@@ -19,8 +20,49 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from scipy.interpolate import griddata
 
+# ---------------------------------------------------------------------------
+# Optional NN imports (requires torch + trained model package)
+# ---------------------------------------------------------------------------
+_MODEL_PARENT = Path(__file__).resolve().parent.parent
+if str(_MODEL_PARENT) not in sys.path:
+    sys.path.insert(0, str(_MODEL_PARENT))
 
-DEFAULT_H5 = Path(__file__).resolve().parent.parent / "data" / "heston_train_val.h5"
+_NN_AVAILABLE = False
+try:
+    import torch
+    from model.network import BatesSurrogate  # type: ignore[import]
+    _NN_AVAILABLE = True
+except Exception:
+    pass
+
+# Physical parameter bounds for normalization (mirrors calibrate.py)
+_PARAM_BOUNDS = np.array(
+    [
+        [0.10, 10.0],    # kappa
+        [0.02,  0.25],   # theta
+        [0.05,  2.00],   # sigma_v
+        [-0.98,  0.10],  # rho
+        [0.02,  0.25],   # v0
+        [0.00,  4.00],   # lambda_j
+        [-0.30,  0.00],  # mu_j
+        [0.01,  0.45],   # sigma_j
+        [0.00,  0.06],   # r
+        [0.00,  0.04],   # q
+    ],
+    dtype=np.float64,
+)
+_BATES_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0", "lambda_j", "mu_j", "sigma_j", "r", "q"]
+
+
+def _normalize_params(params_physical: np.ndarray) -> np.ndarray:
+    """Normalize physical Bates/Heston params to [0, 1]."""
+    lo = _PARAM_BOUNDS[:, 0]
+    hi = _PARAM_BOUNDS[:, 1]
+    return (params_physical - lo) / (hi - lo + 1e-12)
+
+
+DEFAULT_H5 = Path(__file__).resolve().parent.parent / "data" / "heston_guided_pilot.h5"
+DEFAULT_CHECKPOINT = Path(__file__).resolve().parent.parent / "model" / "runs" / "best.pt"
 API_KEYS_PATH = Path(__file__).resolve().parent.parent / "api_keys.json"
 
 FALLBACK_LOG_MONEYNESS = np.array([-0.40, -0.30, -0.20, -0.10, 0.00, 0.10, 0.20, 0.30, 0.40])
@@ -79,6 +121,20 @@ def _load_api_key() -> str:
     return ""
 
 
+@st.cache_resource
+def load_nn_model(checkpoint_path: str):
+    """Load a BatesSurrogate from checkpoint; returns None on failure."""
+    if not _NN_AVAILABLE:
+        return None
+    try:
+        model = BatesSurrogate.from_checkpoint(checkpoint_path)
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(f"Failed to load model checkpoint: {e}")
+        return None
+
+
 st.set_page_config(
     page_title="IV Surface Data Explorer",
     layout="wide",
@@ -88,21 +144,42 @@ st.set_page_config(
 st.sidebar.title("IV Surface Data Explorer")
 mode = st.sidebar.radio(
     "Mode",
-    ["Simulated Data", "Real vs Simulated", "Parameter Space"],
+    ["Simulated Data", "Real vs Simulated", "NN vs Synthetic", "Parameter Space"],
     index=0,
 )
+st.sidebar.markdown("---")
+_max_samples = st.sidebar.number_input(
+    "Max samples to load",
+    min_value=1_000,
+    max_value=10_000_000,
+    value=50_000,
+    step=10_000,
+    help="Randomly subsample the HDF5 dataset to this many rows. Reduces RAM usage drastically.",
+)
+st.sidebar.markdown("---")
 
 
 @st.cache_resource
-def load_h5(path: str):
-    """Load HDF5 datasets and metadata, compatible with legacy and Bates files."""
+def load_h5(path: str, max_samples: int = 50_000):
+    """Load HDF5 datasets and metadata, compatible with legacy and Bates files.
+
+    Only loads up to *max_samples* rows (random subset) to avoid RAM exhaustion
+    on large datasets (e.g. 10 M rows × 300+ surface cells each).
+    """
     with h5py.File(path, "r", swmr=True) as f:
-        params = f["params"][:]
-        iv_surface = f["iv_surface"][:]
-        cell_mask = f["cell_mask"][:]
-        raw_cell_mask = f["raw_cell_mask"][:] if "raw_cell_mask" in f else None
-        valid_count = f["valid_count"][:]
-        market_params = f["market_params"][:] if "market_params" in f else None
+        total = f["params"].shape[0]
+        if max_samples < total:
+            rng = np.random.default_rng(42)
+            idx = np.sort(rng.choice(total, size=max_samples, replace=False))
+        else:
+            idx = slice(None)
+
+        params = f["params"][idx]
+        iv_surface = f["iv_surface"][idx]
+        cell_mask = f["cell_mask"][idx]
+        raw_cell_mask = f["raw_cell_mask"][idx] if "raw_cell_mask" in f else None
+        valid_count = f["valid_count"][idx]
+        market_params = f["market_params"][idx] if "market_params" in f else None
         attrs = dict(f.attrs)
 
     log_m = np.array(attrs.get("log_moneyness", FALLBACK_LOG_MONEYNESS), dtype=np.float64)
@@ -403,7 +480,7 @@ def page_simulated():
         st.warning(f"File not found: {h5_path}")
         return
 
-    params, market_params, iv_surface, cell_mask, raw_cell_mask, valid_count, meta = load_h5(h5_path)
+    params, market_params, iv_surface, cell_mask, raw_cell_mask, valid_count, meta = load_h5(h5_path, _max_samples)
     attrs = meta["attrs"]
     log_m = meta["log_moneyness"]
     mats = meta["maturities"]
@@ -490,21 +567,25 @@ def page_simulated():
         st.plotly_chart(
             plot_iv_surface_3d(iv, f"IV Surface - Sample #{idx}", log_m, mats, mask),
             use_container_width=True,
+            key="sim_3d",
         )
     with tab_heat:
         st.plotly_chart(
             plot_iv_heatmap(iv, f"IV Heatmap - Sample #{idx}", log_m, mat_labels, mask),
             use_container_width=True,
+            key="sim_heat",
         )
     with tab_smile:
         st.plotly_chart(
             plot_smile_overlay(iv, f"Volatility Smiles - Sample #{idx}", log_m, mats, mat_labels, mask),
             use_container_width=True,
+            key="sim_smile",
         )
     with tab_term:
         st.plotly_chart(
             plot_term_structure(iv, f"Term Structure - Sample #{idx}", log_m, mats),
             use_container_width=True,
+            key="sim_term",
         )
 
     st.markdown("---")
@@ -535,7 +616,7 @@ def page_simulated():
             showlegend=False,
             height=450,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="sim_batch_dist")
 
     with col_b:
         atm_idx = int(meta["atm_idx"])
@@ -574,7 +655,7 @@ def page_simulated():
             yaxis_title="ATM IV (%)",
             height=450,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="sim_batch_atm")
 
 
 def page_comparison():
@@ -612,7 +693,7 @@ def page_comparison():
     data_date_str = av_date or raw.get("meta_data", {}).get("date", "")
     data_date = pd.Timestamp(data_date_str) if data_date_str else pd.Timestamp.now()
 
-    params, market_params, iv_surface, cell_mask, raw_cell_mask, _, meta = load_h5(h5_path)
+    params, market_params, iv_surface, cell_mask, raw_cell_mask, _, meta = load_h5(h5_path, _max_samples)
     log_m = meta["log_moneyness"]
     mats = meta["maturities"]
     mat_labels = meta["maturity_labels"]
@@ -626,6 +707,15 @@ def page_comparison():
         )
     else:
         show_raw_mask = False
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Neural Network")
+    nn_ckpt_comp = st.sidebar.text_input(
+        "Checkpoint path",
+        value=str(DEFAULT_CHECKPOINT),
+        key="ckpt_comp",
+        help="Trained BatesSurrogate checkpoint (.pt). Leave blank / missing to skip NN prediction.",
+    )
 
     real_iv = build_real_iv_surface(df, underlying, data_date, log_m, mats)
     real_flat = real_iv.flatten()
@@ -670,6 +760,21 @@ def page_comparison():
     best_dist = float(distances[best_idx])
     best_cov = float(coverage[best_idx])
 
+    # NN prediction for the best synthetic's parameters (optional)
+    iv_nn_best: np.ndarray | None = None
+    if _NN_AVAILABLE and Path(nn_ckpt_comp).exists():
+        _nn_model_comp = load_nn_model(nn_ckpt_comp)
+        if _nn_model_comp is not None:
+            _rq = best_market if best_market is not None else np.zeros(2, dtype=np.float32)
+            _all_phys = np.concatenate([best_params, _rq]).astype(np.float64)
+            _all_phys = np.clip(_all_phys, _PARAM_BOUNDS[:, 0], _PARAM_BOUNDS[:, 1])
+            _theta_n = _normalize_params(_all_phys)
+            with torch.no_grad():
+                _t = torch.tensor(_theta_n, dtype=torch.float32).unsqueeze(0)
+                _iv_flat = _nn_model_comp(_t).squeeze(0).numpy()
+            if _iv_flat.shape[0] == len(log_m) * len(mats):
+                iv_nn_best = _iv_flat.reshape(len(log_m), len(mats))
+
     st.markdown(
         f"**Closest simulated sample:** #{best_idx:,} "
         f"(weighted RMSE: {best_dist:.4f}, weighted coverage: {best_cov * 100:.1f}%)"
@@ -681,8 +786,8 @@ def page_comparison():
         st.markdown("**Estimated market parameters:**")
         _render_param_metrics(meta["market_keys"], best_market)
 
-    tab_smile, tab_3d, tab_diff, tab_raw = st.tabs(
-        ["Smile Comparison", "3D Surfaces", "Difference", "Raw Market Data"]
+    tab_smile, tab_3d, tab_diff, tab_raw, tab_nn = st.tabs(
+        ["Smile Comparison", "3D Surfaces", "Difference", "Raw Market Data", "NN Prediction"]
     )
 
     with tab_smile:
@@ -748,7 +853,7 @@ def page_comparison():
             fig.update_xaxes(title_text="Log-moneyness" if row == n_rows else "", row=row, col=col)
             fig.update_yaxes(title_text="IV (%)" if col == 1 else "", row=row, col=col)
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="comp_smiles")
 
     with tab_3d:
         col1, col2 = st.columns(2)
@@ -756,45 +861,50 @@ def page_comparison():
             st.plotly_chart(
                 plot_iv_surface_3d(real_iv, f"Real: {symbol}", log_m, mats),
                 use_container_width=True,
+                key="comp_3d_real",
             )
         with col2:
             st.plotly_chart(
                 plot_iv_surface_3d(best_iv, "Simulated (closest match)", log_m, mats, best_mask),
                 use_container_width=True,
+                key="comp_3d_best",
             )
 
     with tab_diff:
-        diff_surface = real_iv - best_iv
-        fig = go.Figure(
-            data=go.Heatmap(
-                x=mat_labels,
-                y=[f"{m:+.2f}" for m in log_m],
-                z=diff_surface * 100,
-                colorscale="RdBu_r",
-                zmid=0,
-                colorbar=dict(title="Delta IV (pp)"),
-                hovertemplate=(
-                    "Maturity: %{x}<br>"
-                    "Log-moneyness: %{y}<br>"
-                    "Delta IV: %{z:+.2f} pp<extra></extra>"
-                ),
+        if iv_nn_best is None:
+            st.info("Load a trained checkpoint in the sidebar to see the Real − NN difference.")
+        else:
+            diff_surface = real_iv - iv_nn_best
+            fig = go.Figure(
+                data=go.Heatmap(
+                    x=mat_labels,
+                    y=[f"{m:+.2f}" for m in log_m],
+                    z=diff_surface * 100,
+                    colorscale="RdBu_r",
+                    zmid=0,
+                    colorbar=dict(title="Delta IV (pp)"),
+                    hovertemplate=(
+                        "Maturity: %{x}<br>"
+                        "Log-moneyness: %{y}<br>"
+                        "Delta IV: %{z:+.2f} pp<extra></extra>"
+                    ),
+                )
             )
-        )
-        fig.update_layout(
-            title="Difference (Real - Simulated) in percentage points",
-            xaxis_title="Maturity",
-            yaxis_title="Log-moneyness",
-            height=450,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(
+                title="Difference (Real − NN predicted) in percentage points",
+                xaxis_title="Maturity",
+                yaxis_title="Log-moneyness",
+                height=450,
+            )
+            st.plotly_chart(fig, use_container_width=True, key="comp_diff_heat")
 
-        valid_diff = diff_surface[np.isfinite(diff_surface)]
-        if len(valid_diff) > 0:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Mean Delta", f"{np.mean(valid_diff) * 100:+.2f} pp")
-            c2.metric("RMSE", f"{np.sqrt(np.mean(valid_diff**2)) * 100:.2f} pp")
-            c3.metric("Max |Delta|", f"{np.max(np.abs(valid_diff)) * 100:.2f} pp")
-            c4.metric("Coverage", f"{np.isfinite(diff_surface).sum()}/{diff_surface.size} cells")
+            valid_diff = diff_surface[np.isfinite(diff_surface)]
+            if len(valid_diff) > 0:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Mean Delta", f"{np.mean(valid_diff) * 100:+.2f} pp")
+                c2.metric("RMSE", f"{np.sqrt(np.mean(valid_diff**2)) * 100:.2f} pp")
+                c3.metric("Max |Delta|", f"{np.max(np.abs(valid_diff)) * 100:.2f} pp")
+                c4.metric("Coverage", f"{np.isfinite(diff_surface).sum()}/{diff_surface.size} cells")
 
     with tab_raw:
         st.subheader(f"Raw Options Chain: {symbol}")
@@ -827,7 +937,7 @@ def page_comparison():
             yaxis_title="IV (%)",
             height=500,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="comp_raw")
 
         st.dataframe(
             df[
@@ -848,6 +958,161 @@ def page_comparison():
             use_container_width=True,
         )
 
+    with tab_nn:
+        if iv_nn_best is None:
+            if not _NN_AVAILABLE:
+                st.info("PyTorch is not installed. NN prediction unavailable.")
+            elif not Path(nn_ckpt_comp).exists():
+                st.info(
+                    "Provide a trained checkpoint path in the sidebar to see how the neural network "
+                    "reproduces the synthetic surface that best matched the real data."
+                )
+            else:
+                st.warning("NN output size does not match the current grid — check the checkpoint.")
+        else:
+            # ------------------------------------------------------------------
+            # Summary metrics
+            # ------------------------------------------------------------------
+            real_f = real_iv.flatten()
+            nn_f = iv_nn_best.flatten()
+            best_f = best_iv.flatten()
+            bm_f = best_mask.flatten()
+            rv = np.isfinite(real_f)
+
+            def _wrmse(pred: np.ndarray, target: np.ndarray, valid: np.ndarray) -> float:
+                ok = valid & np.isfinite(pred) & np.isfinite(target)
+                if not ok.any():
+                    return float("nan")
+                return float(np.sqrt(np.mean((pred[ok] - target[ok]) ** 2)) * 10_000)
+
+            rmse_nn_real = _wrmse(nn_f, real_f, rv)
+            rmse_sy_real = _wrmse(best_f, real_f, rv & bm_f)
+            rmse_nn_sy   = _wrmse(nn_f, best_f, bm_f & np.isfinite(best_f))
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("IVRMSE: NN vs Real", f"{rmse_nn_real:.2f} bps",
+                      help="How well the NN surface fits the real market data")
+            c2.metric("IVRMSE: Synthetic vs Real", f"{rmse_sy_real:.2f} bps",
+                      help="How well the closest synthetic surface fits the real market data")
+            c3.metric("IVRMSE: NN vs Synthetic", f"{rmse_nn_sy:.2f} bps",
+                      help="NN approximation error relative to the COS ground truth")
+
+            # ------------------------------------------------------------------
+            # 3-way smile comparison (per maturity)
+            # ------------------------------------------------------------------
+            n_t = len(mat_labels)
+            n_cols = min(4, n_t)
+            n_rows = math.ceil(n_t / n_cols)
+            fig = make_subplots(
+                rows=n_rows, cols=n_cols,
+                subplot_titles=mat_labels,
+                vertical_spacing=0.12,
+                horizontal_spacing=0.06,
+            )
+            for ti, label in enumerate(mat_labels):
+                r = ti // n_cols + 1
+                c = ti % n_cols + 1
+
+                real_col = real_iv[:, ti]
+                vr = np.isfinite(real_col)
+                if vr.any():
+                    fig.add_trace(go.Scatter(
+                        x=log_m[vr], y=real_col[vr] * 100,
+                        mode="lines+markers", name="Real",
+                        line=dict(color="rgb(239,85,59)", width=2),
+                        marker=dict(size=5),
+                        legendgroup="real", showlegend=(ti == 0),
+                    ), row=r, col=c)
+
+                sim_col = best_iv[:, ti]
+                vs = best_mask[:, ti] & np.isfinite(sim_col)
+                if vs.any():
+                    fig.add_trace(go.Scatter(
+                        x=log_m[vs], y=sim_col[vs] * 100,
+                        mode="lines+markers", name="Synthetic (COS)",
+                        line=dict(color="rgb(99,110,250)", width=2, dash="dot"),
+                        marker=dict(size=5, symbol="square"),
+                        legendgroup="syn", showlegend=(ti == 0),
+                    ), row=r, col=c)
+
+                nn_col = iv_nn_best[:, ti]
+                fig.add_trace(go.Scatter(
+                    x=log_m, y=nn_col * 100,
+                    mode="lines+markers", name="NN predicted",
+                    line=dict(color="rgb(0,204,150)", width=2, dash="dash"),
+                    marker=dict(size=5, symbol="diamond"),
+                    legendgroup="nn", showlegend=(ti == 0),
+                ), row=r, col=c)
+
+            fig.update_layout(
+                title=f"3-way Smile: {symbol} Real vs Synthetic vs NN",
+                height=max(420, 280 * n_rows),
+                legend=dict(orientation="h", y=-0.05, itemsizing="constant"),
+            )
+            for i in range(1, n_t + 1):
+                r = (i - 1) // n_cols + 1
+                c = (i - 1) % n_cols + 1
+                fig.update_xaxes(title_text="Log-m" if r == n_rows else "", row=r, col=c)
+                fig.update_yaxes(title_text="IV (%)" if c == 1 else "", row=r, col=c)
+            st.plotly_chart(fig, use_container_width=True, key="comp_nn_smiles")
+
+            # ------------------------------------------------------------------
+            # Side-by-side 3D surfaces
+            # ------------------------------------------------------------------
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.plotly_chart(
+                    plot_iv_surface_3d(real_iv, f"Real: {symbol}", log_m, mats),
+                    use_container_width=True,
+                    key="comp_nn_3d_real",
+                )
+            with c2:
+                st.plotly_chart(
+                    plot_iv_surface_3d(best_iv, "Synthetic (COS)", log_m, mats, best_mask),
+                    use_container_width=True,
+                    key="comp_nn_3d_synth",
+                )
+            with c3:
+                st.plotly_chart(
+                    plot_iv_surface_3d(iv_nn_best, "NN predicted", log_m, mats),
+                    use_container_width=True,
+                    key="comp_nn_3d_nn",
+                )
+
+            # ------------------------------------------------------------------
+            # Difference heatmap: Real − NN
+            # ------------------------------------------------------------------
+            diff_surface = real_iv - iv_nn_best
+            valid_diff = diff_surface[np.isfinite(diff_surface)]
+            fig = go.Figure(
+                data=go.Heatmap(
+                    x=mat_labels,
+                    y=[f"{m:+.2f}" for m in log_m],
+                    z=diff_surface * 100,
+                    colorscale="RdBu_r",
+                    zmid=0,
+                    colorbar=dict(title="ΔIV (pp)"),
+                    hovertemplate=(
+                        "Maturity: %{x}<br>"
+                        "Log-moneyness: %{y}<br>"
+                        "Real − NN: %{z:+.2f} pp<extra></extra>"
+                    ),
+                )
+            )
+            fig.update_layout(
+                title="Difference (Real − NN predicted) in percentage points",
+                xaxis_title="Maturity",
+                yaxis_title="Log-moneyness",
+                height=450,
+            )
+            st.plotly_chart(fig, use_container_width=True, key="comp_nn_diff_heat")
+            if len(valid_diff) > 0:
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Mean Delta", f"{np.mean(valid_diff) * 100:+.2f} pp")
+                d2.metric("RMSE", f"{np.sqrt(np.mean(valid_diff**2)) * 100:.2f} pp")
+                d3.metric("Max |Delta|", f"{np.max(np.abs(valid_diff)) * 100:.2f} pp")
+                d4.metric("Coverage", f"{np.isfinite(diff_surface).sum()}/{diff_surface.size} cells")
+
 
 def page_param_space():
     st.header("Parameter Space Coverage")
@@ -857,7 +1122,7 @@ def page_param_space():
         st.warning(f"File not found: {h5_path}")
         return
 
-    params, _, iv_surface, cell_mask, raw_cell_mask, valid_count, meta = load_h5(h5_path)
+    params, _, iv_surface, cell_mask, raw_cell_mask, valid_count, meta = load_h5(h5_path, _max_samples)
     log_m = meta["log_moneyness"]
     mat_labels = meta["maturity_labels"]
     param_keys = meta["param_keys"]
@@ -902,7 +1167,7 @@ def page_param_space():
             col=col,
         )
     fig.update_layout(height=max(280, 220 * n_rows), margin=dict(t=40, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="params_dists")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -918,7 +1183,7 @@ def page_param_space():
             )
             fig.update_layout(height=400)
             fig.update_traces(marker_size=3)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="params_scatter_rho_sigv")
         else:
             st.info("rho/sigma_v axes are not available in this dataset.")
 
@@ -935,7 +1200,7 @@ def page_param_space():
             )
             fig.update_layout(height=400)
             fig.update_traces(marker_size=3)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="params_scatter_kappa_theta")
         else:
             st.info("Feller diagnostics are unavailable for this dataset schema.")
 
@@ -950,7 +1215,7 @@ def page_param_space():
             yaxis_title="Count",
             height=350,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="params_hist_valid")
 
     with col_b:
         use_mask = raw_cell_mask if raw_cell_mask is not None else cell_mask
@@ -970,7 +1235,7 @@ def page_param_space():
             yaxis_title="Log-moneyness",
             height=350,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="params_heat_nan")
 
     st.subheader("IV Characteristics vs Parameters")
     atm_idx = int(meta["atm_idx"])
@@ -1000,7 +1265,7 @@ def page_param_space():
             )
             fig.update_traces(marker_size=3)
             fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="params_scatter_rho_skew")
         else:
             st.info("rho is unavailable in this dataset.")
 
@@ -1016,14 +1281,258 @@ def page_param_space():
             )
             fig.update_traces(marker_size=3)
             fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="params_scatter_v0_atm")
         else:
             st.info("v0 is unavailable in this dataset.")
+
+
+def page_nn_comparison():
+    st.header("NN Predicted vs Synthetic Ground Truth")
+
+    if not _NN_AVAILABLE:
+        st.error(
+            "PyTorch and the `model` package are required for this mode. "
+            "Install torch and ensure the `model/` directory is present."
+        )
+        return
+
+    h5_path = st.sidebar.text_input("HDF5 path", value=str(DEFAULT_H5), key="h5_nn")
+    ckpt_path = st.sidebar.text_input("Checkpoint path", value=str(DEFAULT_CHECKPOINT), key="ckpt_nn")
+
+    if not Path(h5_path).exists():
+        st.warning(f"HDF5 file not found: {h5_path}")
+        return
+    if not Path(ckpt_path).exists():
+        st.warning(
+            f"Checkpoint not found: {ckpt_path}\n\n"
+            "Train the surrogate first with `python model/train.py`."
+        )
+        return
+
+    model = load_nn_model(ckpt_path)
+    if model is None:
+        return
+
+    params, market_params, iv_surface, cell_mask, raw_cell_mask, valid_count, meta = load_h5(h5_path, _max_samples)
+    log_m = meta["log_moneyness"]
+    mats = meta["maturities"]
+    mat_labels = meta["maturity_labels"]
+    param_keys = meta["param_keys"]
+    N = len(params)
+    NK, NT = meta["NK"], meta["NT"]
+
+    st.sidebar.markdown(f"**Model:** {meta['model_type']}  |  **N:** {N:,}")
+    st.sidebar.markdown("---")
+    sample_mode = st.sidebar.radio("Sample selection", ["Random", "By index"], key="nn_sample_mode")
+
+    if sample_mode == "Random":
+        if st.sidebar.button("New random sample"):
+            st.session_state["nn_idx"] = int(np.random.randint(0, N))
+        idx = st.session_state.get("nn_idx", 0)
+    else:
+        idx = int(st.sidebar.number_input("Sample index", 0, N - 1, 0, key="nn_idx_input"))
+
+    # ------------------------------------------------------------------
+    # Assemble 10-param physical vector and normalize
+    # ------------------------------------------------------------------
+    p_phys = params[idx]                                         # (8,) physical Bates params
+    rq_phys = market_params[idx] if market_params is not None else np.zeros(2, dtype=np.float32)
+    all_phys = np.concatenate([p_phys, rq_phys]).astype(np.float64)  # (10,)
+
+    # Silently clamp to bounds to handle any edge values from older datasets
+    all_phys = np.clip(all_phys, _PARAM_BOUNDS[:, 0], _PARAM_BOUNDS[:, 1])
+    theta_norm = _normalize_params(all_phys)
+
+    # NN forward pass
+    with torch.no_grad():
+        t = torch.tensor(theta_norm, dtype=torch.float32).unsqueeze(0)  # (1, 10)
+        iv_nn_flat = model(t).squeeze(0).numpy()                        # (NK*NT,)
+
+    nn_flat_size = iv_nn_flat.shape[0]
+    if nn_flat_size != NK * NT:
+        st.error(
+            f"NN output size {nn_flat_size} does not match H5 grid "
+            f"{NK}×{NT}={NK * NT}. Ensure the checkpoint was trained on the same grid."
+        )
+        return
+
+    iv_nn = iv_nn_flat.reshape(NK, NT)  # (NK, NT)
+    iv_gt = iv_surface[idx]             # (NK, NT)
+
+    # Use gap-filled mask so the surface is complete (raw_cell_mask leaves holes
+    # where BS IV inversion failed on the original COS prices — common for extreme
+    # parameter combos at short maturities / deep OTM strikes).
+    use_mask = cell_mask[idx]
+
+    # ------------------------------------------------------------------
+    # Header metrics
+    # ------------------------------------------------------------------
+    st.subheader("Parameters")
+    _render_param_metrics(param_keys, p_phys)
+    if market_params is not None:
+        _render_param_metrics(meta["market_keys"], rq_phys)
+
+    valid = use_mask & np.isfinite(iv_gt)
+    if valid.any():
+        diff = iv_nn[valid] - iv_gt[valid]
+        ivrmse = float(np.sqrt(np.mean(diff ** 2)) * 10_000)
+        max_err = float(np.max(np.abs(diff)) * 10_000)
+        mean_err = float(np.mean(diff) * 10_000)
+    else:
+        ivrmse = max_err = mean_err = float("nan")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("IVRMSE", f"{ivrmse:.2f} bps")
+    c2.metric("Max |error|", f"{max_err:.2f} bps")
+    c3.metric("Mean error (bias)", f"{mean_err:+.2f} bps")
+    c4.metric("Sample #", f"{idx:,}")
+
+    # ------------------------------------------------------------------
+    # Tabs
+    # ------------------------------------------------------------------
+    tab_smile, tab_3d, tab_heat, tab_diff = st.tabs(
+        ["Smile Comparison", "3D Surfaces", "Heatmaps", "Difference"]
+    )
+
+    with tab_smile:
+        n_t = len(mat_labels)
+        n_cols = min(4, n_t)
+        n_rows = math.ceil(n_t / n_cols)
+        fig = make_subplots(
+            rows=n_rows, cols=n_cols,
+            subplot_titles=mat_labels,
+            vertical_spacing=0.12,
+            horizontal_spacing=0.06,
+        )
+        for ti, label in enumerate(mat_labels):
+            row = ti // n_cols + 1
+            col = ti % n_cols + 1
+
+            gt_col = iv_gt[:, ti]
+            valid_gt = use_mask[:, ti] & np.isfinite(gt_col)
+            if valid_gt.any():
+                fig.add_trace(
+                    go.Scatter(
+                        x=log_m[valid_gt], y=gt_col[valid_gt] * 100,
+                        mode="lines+markers", name="Synthetic (COS)",
+                        line=dict(color="rgb(99,110,250)", width=2),
+                        marker=dict(size=5),
+                        legendgroup="gt", showlegend=(ti == 0),
+                    ),
+                    row=row, col=col,
+                )
+
+            nn_col = iv_nn[:, ti]
+            fig.add_trace(
+                go.Scatter(
+                    x=log_m, y=nn_col * 100,
+                    mode="lines+markers", name="NN predicted",
+                    line=dict(color="rgb(239,85,59)", width=2, dash="dash"),
+                    marker=dict(size=5, symbol="diamond"),
+                    legendgroup="nn", showlegend=(ti == 0),
+                ),
+                row=row, col=col,
+            )
+
+        fig.update_layout(
+            title=f"Volatility Smile: Synthetic vs NN  (sample #{idx:,})",
+            height=max(420, 280 * n_rows),
+            legend=dict(orientation="h", y=-0.05, itemsizing="constant"),
+        )
+        for i in range(1, n_t + 1):
+            r = (i - 1) // n_cols + 1
+            c = (i - 1) % n_cols + 1
+            fig.update_xaxes(title_text="Log-m" if r == n_rows else "", row=r, col=c)
+            fig.update_yaxes(title_text="IV (%)" if c == 1 else "", row=r, col=c)
+        st.plotly_chart(fig, use_container_width=True, key="nn_smiles")
+
+    with tab_3d:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(
+                plot_iv_surface_3d(iv_gt, "Synthetic (COS ground truth)", log_m, mats, use_mask),
+                use_container_width=True,
+                key="nn_3d_gt",
+            )
+        with col2:
+            st.plotly_chart(
+                plot_iv_surface_3d(iv_nn, "NN predicted", log_m, mats),
+                use_container_width=True,
+                key="nn_3d_nn",
+            )
+
+    with tab_heat:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(
+                plot_iv_heatmap(iv_gt, "Synthetic (COS)", log_m, mat_labels, use_mask),
+                use_container_width=True,
+                key="nn_heat_gt",
+            )
+        with col2:
+            st.plotly_chart(
+                plot_iv_heatmap(iv_nn, "NN predicted", log_m, mat_labels),
+                use_container_width=True,
+                key="nn_heat_nn",
+            )
+
+    with tab_diff:
+        diff_surface = iv_nn - iv_gt
+        diff_masked = np.where(use_mask & np.isfinite(iv_gt), diff_surface, np.nan)
+
+        fig = go.Figure(
+            data=go.Heatmap(
+                x=mat_labels,
+                y=[f"{m:+.2f}" for m in log_m],
+                z=diff_masked * 10_000,
+                colorscale="RdBu_r",
+                zmid=0,
+                colorbar=dict(title="ΔIV (bps)"),
+                hovertemplate=(
+                    "Maturity: %{x}<br>"
+                    "Log-moneyness: %{y}<br>"
+                    "NN − GT: %{z:+.1f} bps<extra></extra>"
+                ),
+            )
+        )
+        fig.update_layout(
+            title="Difference: NN − Synthetic (basis points)",
+            xaxis_title="Maturity",
+            yaxis_title="Log-moneyness",
+            height=450,
+        )
+        st.plotly_chart(fig, use_container_width=True, key="nn_diff_heat")
+
+        # Per-maturity IVRMSE bar chart
+        per_mat_rmse = []
+        for ti in range(NT):
+            v = use_mask[:, ti] & np.isfinite(iv_gt[:, ti])
+            if v.any():
+                per_mat_rmse.append(float(np.sqrt(np.mean((iv_nn[:, ti][v] - iv_gt[:, ti][v]) ** 2)) * 10_000))
+            else:
+                per_mat_rmse.append(float("nan"))
+
+        fig2 = go.Figure(
+            data=go.Bar(
+                x=mat_labels,
+                y=per_mat_rmse,
+                marker_color="rgb(99,110,250)",
+            )
+        )
+        fig2.update_layout(
+            title="IVRMSE by Maturity",
+            xaxis_title="Maturity",
+            yaxis_title="IVRMSE (bps)",
+            height=320,
+        )
+        st.plotly_chart(fig2, use_container_width=True, key="nn_rmse_bar")
 
 
 if mode == "Simulated Data":
     page_simulated()
 elif mode == "Real vs Simulated":
     page_comparison()
+elif mode == "NN vs Synthetic":
+    page_nn_comparison()
 elif mode == "Parameter Space":
     page_param_space()

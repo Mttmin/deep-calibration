@@ -89,7 +89,7 @@ def export_torchscript(
 def export_onnx(
     model:        BatesSurrogate,
     output_path:  str | Path = "model/bates_surrogate.onnx",
-    opset_version: int = 17,
+    opset_version: int = 18,
     verify:       bool = True,
 ) -> str:
     """

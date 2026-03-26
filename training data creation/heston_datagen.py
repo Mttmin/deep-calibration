@@ -104,21 +104,23 @@ def load_guided_param_bank(path: str) -> np.ndarray:
     return flat
 
 
-#  Parameter space — Bates (SVJ) = Heston + Merton log-normal jumps
+#  Parameter space — pure Heston (5 params)
+#
+#  Bounds tightened to market-realistic equity regimes:
+#    θ, v₀ capped at 0.12  (σ_LR/σ₀ ≤ 35%) — 50% long-run vol is crisis-only
+#             and pulls the training mean ATM IV far above typical market levels.
+#    σ_v  capped at 1.20   (>1.20 produces unrealistic wings and numerical issues)
+#  Historical SPX Heston calibrations (normal regimes) cluster well within these.
 
 PARAM_BOUNDS: np.ndarray = np.array([
-    [0.10, 10.0],    # κ    mean-reversion speed
-    [0.02,  0.25],   # θ    long-run variance  (σ_LR ∈ [14%, 50%])
-    [0.05,  2.00],   # σ_v  vol-of-vol (wider to permit stronger short-tenor convexity)
-    [-0.98,  0.10],  # ρ    equity skew almost always negative
-    [0.02,  0.25],   # v₀   initial variance  (σ₀  ∈ [14%, 50%])
-    [0.00,  4.00],   # λ_J  jump intensity (0 recovers pure Heston)
-    [-0.30,  0.00],  # μ_J  mean log-jump size (negative = crash bias)
-    [0.01,  0.45],   # σ_J  jump size volatility
+    [0.30, 8.00],    # κ    mean-reversion speed  (very low κ + high θ is degenerate)
+    [0.02, 0.12],    # θ    long-run variance  (σ_LR ∈ [14%, 35%])
+    [0.05, 1.20],    # σ_v  vol-of-vol
+    [-0.98, 0.10],   # ρ    equity skew almost always negative
+    [0.02, 0.12],    # v₀   initial variance  (σ₀  ∈ [14%, 35%])
 ], dtype=np.float64)
-PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0",
-               "lambda_j", "mu_j", "sigma_j"]
-N_PARAMS: int = len(PARAM_NAMES)  # 8
+PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0"]
+N_PARAMS: int = len(PARAM_NAMES)  # 5
 
 
 #  COS / IV hyperparameters
@@ -224,17 +226,17 @@ def sample_params(
     raw     = sampler.random(n_raw)
     pts_base = qmc.scale(raw, lo, hi)[:n_base]   # float64
 
-    # Mixture prior: dedicate a chunk of samples to stressed skew regimes.
+    # Mixture prior: dedicate a small fraction to stressed skew regimes.
+    # Only σ_v and ρ are stressed — these create realistic short-tenor skew
+    # without inflating the average IV level. Jump boosting is removed since
+    # this is now a pure Heston surrogate.
     rng = np.random.default_rng(seed + 2026)
-    stress_prob = 0.35
+    stress_prob = 0.12
     stress = rng.random(n_base) < stress_prob
     n_stress = int(stress.sum())
     if n_stress > 0:
-        pts_base[stress, 2] = rng.uniform(0.20, 2.00, size=n_stress)    # sigma_v
-        pts_base[stress, 3] = rng.uniform(-0.98, -0.55, size=n_stress)   # rho
-        pts_base[stress, 5] = rng.uniform(1.00, 4.00, size=n_stress)     # lambda_j
-        pts_base[stress, 6] = rng.uniform(-0.30, -0.06, size=n_stress)   # mu_j
-        pts_base[stress, 7] = rng.uniform(0.10, 0.45, size=n_stress)     # sigma_j
+        pts_base[stress, 2] = rng.uniform(0.40, 1.20, size=n_stress)    # sigma_v: stressed but realistic
+        pts_base[stress, 3] = rng.uniform(-0.98, -0.60, size=n_stress)   # rho: steep skew
 
     if n_guided > 0:
         pick = rng.integers(0, len(guided_bank), size=n_guided) # type: ignore
@@ -263,36 +265,27 @@ def sample_params(
 def bates_cf(
     u:      torch.Tensor,   # (Nc,)  real frequencies, float64
     T:      float,
-    params: torch.Tensor,   # (B, 8) float64  [κ, θ, σ_v, ρ, v₀, λ_J, μ_J, σ_J]
+    params: torch.Tensor,   # (B, 5) float64  [κ, θ, σ_v, ρ, v₀]  — pure Heston
     r:      float,
     q:      float,
 ) -> torch.Tensor:           # (B, Nc) complex128
     """
-    φ(u) = E_Q[e^{iu·ln(S_T/S_0)}] under Bates (1996) SVJ model.
+    φ(u) = E_Q[e^{iu·ln(S_T/S_0)}] under Heston (1993) model.
 
-    Heston diffusive component (Little Trap, Albrecher et al. 2007):
+    Little Trap formulation (Albrecher et al. 2007) for branch-cut stability:
         ξ  = κ − iuρσ_v
         d  = √(ξ² + σ_v²·u(u+i))
         g  = (ξ−d) / (ξ+d)
-        logQ = ln((1−g·e^{−dT}) / (1−g))   ← branch-stable form
-
-    Merton log-normal jump component (additive in log-CF):
-        jump = λ·T·(exp(iu·μ_J − ½σ_J²·u²) − 1 − iu·(exp(μ_J + ½σ_J²) − 1))
-
-    When λ_J = 0 this reduces to pure Heston.
+        logQ = ln((1−g·e^{−dT}) / (1−g))
     """
-    κ    = params[:, 0:1]   # (B, 1)
-    θ    = params[:, 1:2]
-    σv   = params[:, 2:3]
-    ρ    = params[:, 3:4]
-    v0   = params[:, 4:5]
-    lam  = params[:, 5:6]   # jump intensity
-    mu_j = params[:, 6:7]   # mean log-jump
-    sig_j = params[:, 7:8]  # jump vol
+    κ  = params[:, 0:1]   # (B, 1)
+    θ  = params[:, 1:2]
+    σv = params[:, 2:3]
+    ρ  = params[:, 3:4]
+    v0 = params[:, 4:5]
 
     uc   = u.to(dtype=torch.complex128)          # (Nc,)
 
-    # ── Heston diffusive component ──
     ξ    = κ - 1j * ρ * σv * uc                 # (B, Nc)
     d    = torch.sqrt(ξ**2 + σv**2 * uc * (uc + 1j))
     g    = (ξ - d) / (ξ + d)
@@ -303,15 +296,7 @@ def bates_cf(
     B = (κ * θ / σv**2) * ((ξ - d) * T - 2.0 * logQ)
     C = (v0  / σv**2)   * (ξ - d) * (1.0 - e_dT) / (1.0 - g * e_dT)
 
-    # ── Merton log-normal jump component ──
-    compensator = torch.exp(mu_j + 0.5 * sig_j**2) - 1.0
-    jump = lam * T * (
-        torch.exp(1j * uc * mu_j - 0.5 * sig_j**2 * uc**2)
-        - 1.0
-        - 1j * uc * compensator
-    )
-
-    return torch.exp(A + B + C + jump)   # (B, Nc) complex128
+    return torch.exp(A + B + C)   # (B, Nc) complex128
 
 
 #  COS call payoff coefficients V_k / K  (precomputed once, float64)
@@ -348,7 +333,7 @@ def cos_call_Vk(dev: torch.device) -> torch.Tensor:   # (Nc,) float64
 #  Vectorised COS call pricer — one maturity, B params × NK strikes
 
 def cos_call_prices(
-    params:  torch.Tensor,   # (B, 8) float64
+    params:  torch.Tensor,   # (B, 5) float64  [κ, θ, σ_v, ρ, v₀]
     Vk:      torch.Tensor,   # (Nc,)  float64
     T:       float,
     S0:      float,
@@ -470,13 +455,10 @@ def prices_to_iv(
 
 def sanity_check(dev: torch.device) -> None:
     """
-    Two-part sanity check:
-      1. Bates with λ=0 vs pure Heston numpy reference (regression test)
-      2. Bates with jumps vs numpy Bates reference
-
+    Heston COS pricer vs numpy f64 reference.
     Expects < 0.001% price error (f64 truncation vs analytical).
     """
-    print("\n[sanity] Part 1: Bates(λ=0) vs pure Heston numpy reference ...")
+    print("\n[sanity] Heston GPU-COS vs numpy reference ...")
 
     def heston_cf_np(u, T, kappa, theta, sv, rho, v0, r=0., q=0.):
         xi=kappa-1j*rho*sv*u; d=np.sqrt(xi**2+sv**2*u*(u+1j))
@@ -484,17 +466,9 @@ def sanity_check(dev: torch.device) -> None:
         return np.exp(1j*u*(r-q)*T + (kappa*theta/sv**2)*((xi-d)*T-2*logQ)
                       + (v0/sv**2)*(xi-d)*(1-e_dT)/(1-g*e_dT))
 
-    def cos_f64_np(S0, K, T, kappa, theta, sv, rho, v0, r=0., q=0.,
-                   lam=0., mu_j=0., sig_j=0.1, N=256, H=3.0):
+    def cos_f64_np(S0, K, T, kappa, theta, sv, rho, v0, r=0., q=0., N=256, H=3.0):
         a,b=-H,H; ba=b-a; k=np.arange(N,dtype=float); u_k=k*math.pi/ba
-        # Heston CF
         phi=heston_cf_np(u_k,T,kappa,theta,sv,rho,v0,r,q)
-        # Merton jump CF (multiplicative in phi)
-        if lam > 0:
-            compensator = np.exp(mu_j + 0.5*sig_j**2) - 1.0
-            jump = lam*T*(np.exp(1j*u_k*mu_j - 0.5*sig_j**2*u_k**2) - 1.0
-                          - 1j*u_k*compensator)
-            phi = phi * np.exp(jump)
         c=phi*np.exp(-1j*u_k*a); x=math.log(S0/K); alpha=k*math.pi/ba; ang0=-alpha*a
         denom=1+alpha**2; denom[0]=1.
         chi=(math.exp(b)*np.cos(k*np.pi)-np.cos(ang0)-alpha*np.sin(ang0))/denom; chi[0]=math.exp(b)-1
@@ -508,37 +482,16 @@ def sanity_check(dev: torch.device) -> None:
     K_t    = torch.tensor([S0], device=dev, dtype=torch.float64)
     k_idx  = torch.arange(N_COS, device=dev)
     Vk     = cos_call_Vk(dev)
-    # Bates params with λ=0 (pure Heston)
-    par    = torch.tensor([[kappa, theta, sv, rho, v0, 0.0, 0.0, 0.1]],
-                          device=dev, dtype=torch.float64)
+    par    = torch.tensor([[kappa, theta, sv, rho, v0]], device=dev, dtype=torch.float64)
     is_put = torch.tensor([False], device=dev)
 
-    # Test a subset of maturities for speed (1M, 6M, 2Y)
+    # Test 1M, 6M, 2Y
     test_maturities = [MATURITIES[0], MATURITIES[5], MATURITIES[-1]]
 
     all_ok = True
     for T in test_maturities:
         ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r, q)
         gpu  = cos_call_prices(par, Vk, float(T), S0, K_t, r, q, k_idx)[0, 0].item()
-        pe   = abs(gpu - ref) / (ref + 1e-15) * 100
-        otm  = torch.tensor([[gpu]], device=dev, dtype=torch.float64)
-        iv   = prices_to_iv(otm, K_t, float(T), S0, r, q, is_put)[0, 0].item()
-        ok   = pe < 0.001 and not math.isnan(iv)
-        all_ok &= ok
-        print(
-            f"  T={T:.4f}  ref={ref:.8f}  gpu={gpu:.8f}  "
-            f"err={pe:.5f}%  iv={iv:.5f}  {'OK' if ok else 'FAIL'}"
-        )
-
-    print("\n[sanity] Part 2: Bates with jumps vs numpy Bates reference ...")
-    lam, mu_j, sig_j = 0.5, -0.08, 0.15
-    par_j = torch.tensor([[kappa, theta, sv, rho, v0, lam, mu_j, sig_j]],
-                         device=dev, dtype=torch.float64)
-
-    for T in test_maturities:
-        ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r, q,
-                          lam=lam, mu_j=mu_j, sig_j=sig_j)
-        gpu  = cos_call_prices(par_j, Vk, float(T), S0, K_t, r, q, k_idx)[0, 0].item()
         pe   = abs(gpu - ref) / (ref + 1e-15) * 100
         otm  = torch.tensor([[gpu]], device=dev, dtype=torch.float64)
         iv   = prices_to_iv(otm, K_t, float(T), S0, r, q, is_put)[0, 0].item()
@@ -611,7 +564,7 @@ def generate(
         total_cells = NK * NT
         vc_dtype = "uint8" if total_cells <= 255 else "uint16"
 
-        f.attrs["model_type"]    = "bates"
+        f.attrs["model_type"]    = "heston"
         f.attrs["nan_policy"]    = nan_policy
         f.attrs["guided_bank"]   = guided_bank_path if guided_bank_path else ""
         f.attrs["guided_weight"] = guided_weight
@@ -729,7 +682,7 @@ class BatesDataset(torch.utils.data.Dataset):
     """
     Returns (params_norm, iv_flat, mask_flat) or, when return_confidence=True,
     (params_norm, iv_flat, mask_flat, conf_flat):
-      params_norm : (N_PARAMS+2,) float32  normalised to [0,1] (8 Bates params + r, q)
+      params_norm : (N_PARAMS+2,) float32  normalised to [0,1] (5 Heston params + r, q)
       iv_flat     : (NK*NT,)      float32  IVs; NaN replaced with 0
       mask_flat   : (NK*NT,)      bool     True where IV is valid
       conf_flat   : (NK*NT,)      float32  per-cell confidence proxy (when requested)

@@ -351,6 +351,60 @@ def plot_iv_surface_3d(
     return fig
 
 
+def plot_iv_surface_3d_overlay(
+    surfaces: list[tuple],
+    log_moneyness: np.ndarray,
+    maturities: np.ndarray,
+    title: str = "IV Surface Comparison",
+) -> go.Figure:
+    """Overlay multiple IV surfaces on a single 3D figure.
+
+    surfaces: list of (iv_array, mask_or_None, label, colorscale)
+    """
+    colorscale_map = {
+        "Reds": [[0, "rgb(254,224,210)"], [1, "rgb(165,15,21)"]],
+        "Blues": [[0, "rgb(198,219,239)"], [1, "rgb(8,48,107)"]],
+        "Greens": [[0, "rgb(199,233,192)"], [1, "rgb(0,109,44)"]],
+    }
+    fig = go.Figure()
+    for iv, mask, label, colorscale in surfaces:
+        iv_plot = iv.copy()
+        if mask is not None:
+            iv_plot[~mask] = np.nan
+        cs = colorscale_map.get(colorscale, colorscale)
+        fig.add_trace(
+            go.Surface(
+                x=maturities,
+                y=log_moneyness,
+                z=iv_plot * 100,
+                colorscale=cs,
+                opacity=0.72,
+                name=label,
+                showlegend=True,
+                showscale=False,
+                hovertemplate=(
+                    f"<b>{label}</b><br>"
+                    "Maturity: %{x:.3f}Y<br>"
+                    "Log-moneyness: %{y:.2f}<br>"
+                    "IV: %{z:.2f}%<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="Maturity (years)",
+            yaxis_title="Log-moneyness",
+            zaxis_title="IV (%)",
+            camera=dict(eye=dict(x=1.6, y=-1.6, z=0.8)),
+        ),
+        height=620,
+        margin=dict(l=0, r=0, t=40, b=0),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(255,255,255,0.8)"),
+    )
+    return fig
+
+
 def plot_iv_heatmap(
     iv: np.ndarray,
     title: str,
@@ -1057,61 +1111,180 @@ def page_comparison():
             st.plotly_chart(fig, use_container_width=True, key="comp_nn_smiles")
 
             # ------------------------------------------------------------------
-            # Side-by-side 3D surfaces
+            # 3D surfaces: overlay + side by side
             # ------------------------------------------------------------------
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.plotly_chart(
-                    plot_iv_surface_3d(real_iv, f"Real: {symbol}", log_m, mats),
-                    use_container_width=True,
-                    key="comp_nn_3d_real",
+            sub3d_overlay, sub3d_side = st.tabs(["Overlay 3D", "Side by Side"])
+            with sub3d_overlay:
+                fig_ov = plot_iv_surface_3d_overlay(
+                    [
+                        (real_iv, None, f"Real: {symbol}", "Reds"),
+                        (best_iv, best_mask, "Synthetic (COS)", "Blues"),
+                        (iv_nn_best, None, "NN predicted", "Greens"),
+                    ],
+                    log_m, mats,
+                    title=f"3-Way IV Surface: {symbol}  Real / Synthetic / NN",
                 )
-            with c2:
-                st.plotly_chart(
-                    plot_iv_surface_3d(best_iv, "Synthetic (COS)", log_m, mats, best_mask),
-                    use_container_width=True,
-                    key="comp_nn_3d_synth",
+                st.plotly_chart(fig_ov, use_container_width=True, key="comp_nn_3d_overlay")
+                st.caption(
+                    "Red = Real market data  |  Blue = Closest synthetic (COS pricing)  |  Green = Neural network prediction. "
+                    "Drag to rotate, scroll to zoom."
                 )
-            with c3:
-                st.plotly_chart(
-                    plot_iv_surface_3d(iv_nn_best, "NN predicted", log_m, mats),
-                    use_container_width=True,
-                    key="comp_nn_3d_nn",
-                )
+            with sub3d_side:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.plotly_chart(
+                        plot_iv_surface_3d(real_iv, f"Real: {symbol}", log_m, mats),
+                        use_container_width=True, key="comp_nn_3d_real",
+                    )
+                with c2:
+                    st.plotly_chart(
+                        plot_iv_surface_3d(best_iv, "Synthetic (COS)", log_m, mats, best_mask),
+                        use_container_width=True, key="comp_nn_3d_synth",
+                    )
+                with c3:
+                    st.plotly_chart(
+                        plot_iv_surface_3d(iv_nn_best, "NN predicted", log_m, mats),
+                        use_container_width=True, key="comp_nn_3d_nn",
+                    )
 
             # ------------------------------------------------------------------
-            # Difference heatmap: Real − NN
+            # Term structure comparison: all 3 sources at key moneyness levels
             # ------------------------------------------------------------------
-            diff_surface = real_iv - iv_nn_best
-            valid_diff = diff_surface[np.isfinite(diff_surface)]
-            fig = go.Figure(
-                data=go.Heatmap(
-                    x=mat_labels,
-                    y=[f"{m:+.2f}" for m in log_m],
-                    z=diff_surface * 100,
-                    colorscale="RdBu_r",
-                    zmid=0,
-                    colorbar=dict(title="ΔIV (pp)"),
-                    hovertemplate=(
-                        "Maturity: %{x}<br>"
-                        "Log-moneyness: %{y}<br>"
-                        "Real − NN: %{z:+.2f} pp<extra></extra>"
-                    ),
-                )
+            st.subheader("Term Structure Comparison")
+            target_levels = np.array([-0.20, -0.10, 0.00, 0.10, 0.20])
+            key_idx = np.unique([int(np.argmin(np.abs(log_m - t))) for t in target_levels])
+
+            fig_ts = go.Figure()
+            for si in key_idx.tolist():
+                m_label = f"m={log_m[si]:+.2f}"
+
+                real_row = real_iv[si, :]
+                vr = np.isfinite(real_row)
+                if vr.any():
+                    fig_ts.add_trace(go.Scatter(
+                        x=mats[vr], y=real_row[vr] * 100,
+                        mode="lines+markers", name=f"Real {m_label}",
+                        line=dict(color="rgb(239,85,59)", width=2),
+                        marker=dict(size=6), legendgroup=f"real_{si}",
+                    ))
+
+                sim_row = best_iv[si, :]
+                vs = best_mask[si, :] & np.isfinite(sim_row)
+                if vs.any():
+                    fig_ts.add_trace(go.Scatter(
+                        x=mats[vs], y=sim_row[vs] * 100,
+                        mode="lines+markers", name=f"Synthetic {m_label}",
+                        line=dict(color="rgb(99,110,250)", width=2, dash="dot"),
+                        marker=dict(size=6, symbol="square"), legendgroup=f"syn_{si}",
+                    ))
+
+                nn_row = iv_nn_best[si, :]
+                fig_ts.add_trace(go.Scatter(
+                    x=mats, y=nn_row * 100,
+                    mode="lines+markers", name=f"NN {m_label}",
+                    line=dict(color="rgb(0,204,150)", width=2, dash="dash"),
+                    marker=dict(size=6, symbol="diamond"), legendgroup=f"nn_{si}",
+                ))
+
+            fig_ts.update_layout(
+                title=f"Term Structure by Moneyness: {symbol} Real / Synthetic / NN",
+                xaxis_title="Maturity (years)",
+                yaxis_title="IV (%)",
+                height=500,
+                legend=dict(
+                    orientation="v", x=1.01, y=1,
+                    bgcolor="rgba(255,255,255,0.8)", borderwidth=1,
+                ),
             )
-            fig.update_layout(
-                title="Difference (Real − NN predicted) in percentage points",
+            st.plotly_chart(fig_ts, use_container_width=True, key="comp_nn_term_struct")
+
+            # ------------------------------------------------------------------
+            # Pairwise difference heatmaps (3 pairs)
+            # ------------------------------------------------------------------
+            st.subheader("Pairwise Differences")
+            diff_real_nn  = real_iv - iv_nn_best
+            diff_real_sim = real_iv - best_iv
+            diff_sim_nn   = best_iv - iv_nn_best
+
+            diff_c1, diff_c2, diff_c3 = st.columns(3)
+            for col_w, diff_surf, title_diff, key_diff in [
+                (diff_c1, diff_real_nn,  "Real − NN (pp)",         "comp_nn_diff_rnn"),
+                (diff_c2, diff_real_sim, "Real − Synthetic (pp)",  "comp_nn_diff_rsim"),
+                (diff_c3, diff_sim_nn,   "Synthetic − NN (pp)",    "comp_nn_diff_simnn"),
+            ]:
+                with col_w:
+                    fig_d = go.Figure(data=go.Heatmap(
+                        x=mat_labels,
+                        y=[f"{m:+.2f}" for m in log_m],
+                        z=diff_surf * 100,
+                        colorscale="RdBu_r",
+                        zmid=0,
+                        colorbar=dict(title="pp"),
+                        hovertemplate=(
+                            "Maturity: %{x}<br>"
+                            "Log-m: %{y}<br>"
+                            "Δ: %{z:+.2f} pp<extra></extra>"
+                        ),
+                    ))
+                    fig_d.update_layout(
+                        title=title_diff,
+                        xaxis_title="Maturity",
+                        yaxis_title="Log-m",
+                        height=380,
+                        margin=dict(l=0, r=0, t=40, b=0),
+                    )
+                    st.plotly_chart(fig_d, use_container_width=True, key=key_diff)
+
+            stat_cols = st.columns(3)
+            for i, (diff_surf, label_diff) in enumerate([
+                (diff_real_nn,  "Real − NN"),
+                (diff_real_sim, "Real − Sim"),
+                (diff_sim_nn,   "Sim − NN"),
+            ]):
+                valid_d = diff_surf[np.isfinite(diff_surf)]
+                if len(valid_d) > 0:
+                    stat_cols[i].markdown(f"**{label_diff}**")
+                    stat_cols[i].markdown(
+                        f"RMSE: **{np.sqrt(np.mean(valid_d**2)) * 100:.2f} pp**  |  "
+                        f"Bias: **{np.mean(valid_d) * 100:+.2f} pp**  |  "
+                        f"Max|Δ|: **{np.max(np.abs(valid_d)) * 100:.2f} pp**"
+                    )
+
+            # ------------------------------------------------------------------
+            # Per-maturity IVRMSE bar chart for all 3 pairs
+            # ------------------------------------------------------------------
+            st.subheader("Per-Maturity IVRMSE")
+            per_mat_nn_real, per_mat_sim_real, per_mat_nn_sim = [], [], []
+
+            def _rmse_col(a: np.ndarray, b: np.ndarray, v: np.ndarray) -> float:
+                ok = v & np.isfinite(a) & np.isfinite(b)
+                return float(np.sqrt(np.mean((a[ok] - b[ok]) ** 2)) * 10_000) if ok.any() else float("nan")
+
+            for ti in range(len(mats)):
+                r_col  = real_iv[:, ti]
+                s_col  = best_iv[:, ti]
+                n_col  = iv_nn_best[:, ti]
+                sm     = best_mask[:, ti]
+                per_mat_nn_real.append(_rmse_col(n_col, r_col, np.isfinite(r_col)))
+                per_mat_sim_real.append(_rmse_col(s_col, r_col, sm & np.isfinite(r_col)))
+                per_mat_nn_sim.append(_rmse_col(n_col, s_col, sm & np.isfinite(s_col)))
+
+            fig_rmse = go.Figure()
+            for bar_name, vals, bar_color in [
+                ("NN vs Real",        per_mat_nn_real,  "rgb(0,204,150)"),
+                ("Synthetic vs Real", per_mat_sim_real, "rgb(99,110,250)"),
+                ("NN vs Synthetic",   per_mat_nn_sim,   "rgb(255,161,90)"),
+            ]:
+                fig_rmse.add_trace(go.Bar(x=mat_labels, y=vals, name=bar_name, marker_color=bar_color))
+            fig_rmse.update_layout(
+                title="Per-Maturity IVRMSE (basis points)",
                 xaxis_title="Maturity",
-                yaxis_title="Log-moneyness",
-                height=450,
+                yaxis_title="IVRMSE (bps)",
+                barmode="group",
+                height=380,
+                legend=dict(orientation="h", y=-0.18),
             )
-            st.plotly_chart(fig, use_container_width=True, key="comp_nn_diff_heat")
-            if len(valid_diff) > 0:
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Mean Delta", f"{np.mean(valid_diff) * 100:+.2f} pp")
-                d2.metric("RMSE", f"{np.sqrt(np.mean(valid_diff**2)) * 100:.2f} pp")
-                d3.metric("Max |Delta|", f"{np.max(np.abs(valid_diff)) * 100:.2f} pp")
-                d4.metric("Coverage", f"{np.isfinite(diff_surface).sum()}/{diff_surface.size} cells")
+            st.plotly_chart(fig_rmse, use_container_width=True, key="comp_nn_rmse_bar")
 
 
 def page_param_space():
@@ -1447,19 +1620,32 @@ def page_nn_comparison():
         st.plotly_chart(fig, use_container_width=True, key="nn_smiles")
 
     with tab_3d:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(
-                plot_iv_surface_3d(iv_gt, "Synthetic (COS ground truth)", log_m, mats, use_mask),
-                use_container_width=True,
-                key="nn_3d_gt",
+        nn_sub_ov, nn_sub_sb = st.tabs(["Overlay 3D", "Side by Side"])
+        with nn_sub_ov:
+            fig_nn_ov = plot_iv_surface_3d_overlay(
+                [
+                    (iv_gt, use_mask, "Synthetic (COS)", "Blues"),
+                    (iv_nn, None, "NN predicted", "Reds"),
+                ],
+                log_m, mats,
+                title=f"IV Surface Overlay: Synthetic vs NN  (sample #{idx:,})",
             )
-        with col2:
-            st.plotly_chart(
-                plot_iv_surface_3d(iv_nn, "NN predicted", log_m, mats),
-                use_container_width=True,
-                key="nn_3d_nn",
-            )
+            st.plotly_chart(fig_nn_ov, use_container_width=True, key="nn_3d_overlay")
+            st.caption("Blue = Synthetic COS ground truth  |  Red = Neural network prediction. Drag to rotate.")
+        with nn_sub_sb:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(
+                    plot_iv_surface_3d(iv_gt, "Synthetic (COS ground truth)", log_m, mats, use_mask),
+                    use_container_width=True,
+                    key="nn_3d_gt",
+                )
+            with col2:
+                st.plotly_chart(
+                    plot_iv_surface_3d(iv_nn, "NN predicted", log_m, mats),
+                    use_container_width=True,
+                    key="nn_3d_nn",
+                )
 
     with tab_heat:
         col1, col2 = st.columns(2)

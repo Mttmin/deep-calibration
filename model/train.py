@@ -161,15 +161,18 @@ def resolve_auto_preload(
         f"free vram={_format_gb(vram_free)} (budget={_format_gb(vram_budget)}) | "
         f"free ram={_format_gb(ram_free)} (budget={_format_gb(ram_budget)})"
     )
-
-    if device.type == "cuda" and total_bytes <= vram_budget:
-        return "all", "cuda", "cuda"
+    # Prefer RAM preload when the entire dataset fits in RAM, even if VRAM
+    # could also hold it. Preloading to CPU RAM allows multiple DataLoader
+    # workers (parallel batch preparation + pinning) while still using GPU
+    # for compute, which often yields better host-device overlap.
     if total_bytes <= ram_budget:
         return "all", "cpu", "cpu"
-    if device.type == "cuda" and train_bytes <= vram_budget:
-        return "train", "cuda", "cpu"
+    if device.type == "cuda" and total_bytes <= vram_budget:
+        return "all", "cuda", "cuda"
     if train_bytes <= ram_budget:
         return "train", "cpu", "cpu"
+    if device.type == "cuda" and train_bytes <= vram_budget:
+        return "train", "cuda", "cpu"
     return "none", "cpu", "cpu"
 
 def build_dataloaders(
@@ -256,13 +259,21 @@ def build_dataloaders(
             "return_confidence": False,
         }, "val", val_preload, val_preload_device)
 
-    if train_preload and num_workers > 0:
-        print("[data] train preload active; forcing train num_workers=0")
-    if val_preload and num_workers > 0:
-        print("[data] val preload active; forcing val num_workers=0")
+    # If preloading to CUDA, we must force single-process loading because
+    # CUDA tensors cannot be easily shared across worker processes. If
+    # preloading to CPU RAM, keep the requested number of workers so the
+    # DataLoader can parallelise batching / pinning to speed host-side work.
+    if train_preload and num_workers > 0 and train_preload_device == "cuda":
+        print("[data] train preload active to CUDA; forcing train num_workers=0")
+        train_workers = 0
+    else:
+        train_workers = num_workers
 
-    train_workers = 0 if train_preload else num_workers
-    val_workers = 0 if val_preload else num_workers
+    if val_preload and num_workers > 0 and val_preload_device == "cuda":
+        print("[data] val preload active to CUDA; forcing val num_workers=0")
+        val_workers = 0
+    else:
+        val_workers = num_workers
 
     def _loader_kwargs(workers: int, pin_memory: bool) -> dict:
         return dict(
@@ -366,8 +377,8 @@ def train_one_epoch(
 
         # Denormalise r and q for vega weight computation
         compute_t0 = time.perf_counter()
-        r = params_norm[:, 8] * 0.06   # r_bounds = [0.0, 0.06]
-        q = params_norm[:, 9] * 0.04   # q_bounds = [0.0, 0.04]
+        r = params_norm[:, 5] * 0.06   # r at index 5 (5 Heston params then r, q)
+        q = params_norm[:, 6] * 0.04   # q at index 6
 
         # Vega weights: computed in float32 on the ground-truth IV
         vega_w = compute_vega_weights(iv_flat, grid, r, q)
@@ -432,8 +443,8 @@ def validate(
         iv_flat     = batch[1].to(device, non_blocking=True)
         mask_flat   = batch[2].to(device, non_blocking=True)
 
-        r = params_norm[:, 8] * 0.06
-        q = params_norm[:, 9] * 0.04
+        r = params_norm[:, 5] * 0.06
+        q = params_norm[:, 6] * 0.04
 
         vega_w  = compute_vega_weights(iv_flat, grid, r, q)
         iv_pred = model(params_norm)
@@ -571,7 +582,7 @@ def main() -> None:
 
     # Model
     model_config = dict(
-        n_params  = 10,
+        n_params  = 7,   # 5 Heston params + r + q
         n_outputs = grid.N_FLAT,
         width     = args.width,
         n_blocks  = args.n_blocks,

@@ -1,25 +1,25 @@
 """
 model/network.py
 ================
-HestonSurrogate  —  feedforward IV-surface surrogate for the Heston (1993) model.
+Grid-aware IV-surface surrogate for Heston/Bates calibration.
 
-Architecture (default):
-  Input  θ : (B, 7)    5 Heston params + r + q, all normalised to [0, 1]
-  Stem      : Linear(7→512) → LayerNorm → SiLU
-  Body      : 6 × ResBlock(512)  [pre-norm, skip + SiLU]
-  Head      : Linear(512→686) → softplus(β=3) + 0.01
-  Output    : (B, 686)  implied volatilities ∈ (0.01, ~3.0)
+Default architecture:
+    Input θ: (B, 7)  -> trunk MLP (pre-norm residual blocks)
+    Head:
+        1) factorized grid head (low-rank strike x maturity composition)
+        2) small residual correction head on the flattened surface
+    Output: softplus(raw, beta=3) + 0.01
 
-~3.9 M parameters.  BF16-safe (pre-norm avoids gradient spikes).
-
-Also exports:
-  GridConstants  —  fixed 49-point moneyness / 14-point maturity grid.
+The factorized head is tailored to implied-vol surfaces where most variation
+is low-rank across strike/maturity, improving sample efficiency versus a
+single flat linear projection.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 import h5py
 import numpy as np
@@ -138,24 +138,66 @@ class ResBlock(nn.Module):
         return F.silu(x + h)
 
 
+class GridFactorizedHead(nn.Module):
+    """Low-rank strike x maturity head with additive row/column biases.
+
+    Given trunk features h in R^width:
+      A = Wk(h) in R^(NK x R)
+      B = Wt(h) in R^(NT x R)
+      S_ij = <A_i, B_j> + bk_i + bt_j + bg
+
+    A small residual linear head is added by the main model to recover
+    high-frequency structure not captured by the low-rank term.
+    """
+
+    def __init__(self, width: int, nk: int, nt: int, rank: int, dropout: float) -> None:
+        super().__init__()
+        self.nk = nk
+        self.nt = nt
+        self.rank = rank
+
+        self.norm = nn.LayerNorm(width)
+        self.dropout = nn.Dropout(dropout)
+
+        self.k_factors = nn.Linear(width, nk * rank)
+        self.t_factors = nn.Linear(width, nt * rank)
+        self.k_bias = nn.Linear(width, nk)
+        self.t_bias = nn.Linear(width, nt)
+        self.global_bias = nn.Linear(width, 1)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        bsz = h.shape[0]
+        z = self.dropout(self.norm(h))
+
+        a = self.k_factors(z).view(bsz, self.nk, self.rank)
+        b = self.t_factors(z).view(bsz, self.nt, self.rank)
+        kb = self.k_bias(z).view(bsz, self.nk, 1)
+        tb = self.t_bias(z).view(bsz, 1, self.nt)
+        gb = self.global_bias(z).view(bsz, 1, 1)
+
+        raw_grid = torch.einsum("bnr,bmr->bnm", a, b) + kb + tb + gb
+        return raw_grid.reshape(bsz, self.nk * self.nt)
+
+
 # ---------------------------------------------------------------------------
 # Main surrogate
 # ---------------------------------------------------------------------------
 
 class BatesSurrogate(nn.Module):
     """
-    Feedforward pricing surrogate  θ → Σ(θ).
+    Feedforward pricing surrogate θ -> Sigma(theta).
 
-    Maps 10-dimensional Bates/Heston parameter vectors (normalised to [0, 1])
-    to a 686-dimensional flattened implied-volatility surface (49 strikes ×
-    14 maturities).  Output values are strictly positive via
-    ``softplus(x, β=3) + 0.01``.
+    Maps parameter vectors (default 7: 5 Heston + r + q, all normalised to
+    [0, 1]) to a flattened IV surface. The default output size is 686 (49 x 14).
 
     Args:
         n_params:  Input dimension.  Default 10 (8 Bates + r + q).
         n_outputs: Output dimension. Default 686 (49 × 14).
         width:     Hidden width.     Default 512.
-        n_blocks:  Residual blocks.  Default 6 (≥ 6 requires residual connections).
+        n_blocks:  Residual blocks.  Default 6.
+        nk:        Number of strikes in grid. Default 49.
+        nt:        Number of maturities in grid. Default 14.
+        rank:      Low-rank dimension for the factorized head. Default 24.
     """
 
     def __init__(
@@ -164,32 +206,63 @@ class BatesSurrogate(nn.Module):
         n_outputs: int = 686,
         width: int = 512,
         n_blocks: int = 6,
+        nk: int = 49,
+        nt: int = 14,
+        rank: int = 24,
+        dropout: float = 0.10,
     ) -> None:
         super().__init__()
         self.n_params  = n_params
         self.n_outputs = n_outputs
         self.width     = width
         self.n_blocks  = n_blocks
+        self.nk        = nk
+        self.nt        = nt
+        self.rank      = rank
+
+        if self.nk * self.nt != self.n_outputs:
+            raise ValueError(
+                f"Expected nk*nt == n_outputs, got {self.nk}*{self.nt} != {self.n_outputs}"
+            )
 
         # Stem: project input to hidden width
         self.stem = nn.Sequential(
             nn.Linear(n_params, width * 2),
             nn.LayerNorm(width * 2),
             SwiGLU(),
-            # dropout
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
         )
         
         # Body: residual blocks
         self.blocks = nn.ModuleList([ResBlock(width) for _ in range(n_blocks)])
 
-        # Head: project to output
-        self.head = nn.Linear(width, n_outputs)
+        # Grid-aware head plus a residual correction on the flattened surface.
+        self.grid_head = GridFactorizedHead(width, nk=self.nk, nt=self.nt, rank=rank, dropout=dropout)
+        self.residual_head = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, width * 2),
+            SwiGLU(),
+            nn.Dropout(dropout),
+            nn.Linear(width, n_outputs),
+        )
 
         # Weight initialisation (PyTorch defaults are Xavier uniform for Linear,
         # which is fine; we tweak the final head to start near a plausible IV)
-        nn.init.zeros_(self.head.bias)
-        nn.init.xavier_uniform_(self.head.weight, gain=0.1)
+        for layer in [
+            self.grid_head.k_factors,
+            self.grid_head.t_factors,
+            self.grid_head.k_bias,
+            self.grid_head.t_bias,
+            self.grid_head.global_bias,
+        ]:
+            nn.init.xavier_uniform_(layer.weight, gain=0.05)
+            nn.init.zeros_(layer.bias)
+
+        final = self.residual_head[-1]
+        if not isinstance(final, nn.Linear):
+            raise TypeError("residual_head final layer must be nn.Linear")
+        nn.init.zeros_(final.bias)
+        nn.init.xavier_uniform_(final.weight, gain=0.1)
 
     def forward(self, theta: torch.Tensor) -> torch.Tensor:
         """
@@ -201,7 +274,7 @@ class BatesSurrogate(nn.Module):
         x = self.stem(theta)
         for block in self.blocks:
             x = block(x)
-        raw = self.head(x)
+        raw = self.grid_head(x) + self.residual_head(x)
         # softplus(β=3) is a smooth, everywhere-differentiable lower bound;
         # + 0.01 ensures IVs never collapse to zero during early training.
         return F.softplus(raw, beta=3) + 0.01
@@ -209,18 +282,54 @@ class BatesSurrogate(nn.Module):
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def load_compatible_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> None:
+        """Load checkpoints from both legacy and current architectures.
+
+        Legacy checkpoints used a single flat head named ``head``. We map that
+        into the residual head's final linear layer and leave the factorized
+        head at its initialisation.
+        """
+        sd = dict(state_dict)
+
+        # Legacy mapping: head.{weight,bias} -> residual_head.4.{weight,bias}
+        if "head.weight" in sd and "residual_head.4.weight" not in sd:
+            sd["residual_head.4.weight"] = sd.pop("head.weight")
+        if "head.bias" in sd and "residual_head.4.bias" not in sd:
+            sd["residual_head.4.bias"] = sd.pop("head.bias")
+
+        missing, unexpected = self.load_state_dict(sd, strict=False)
+
+        # Allow missing grid-head parameters when loading legacy checkpoints.
+        allowed_missing_prefixes = (
+            "grid_head.",
+            "residual_head.0.",
+            "residual_head.1.",
+            "residual_head.3.",
+        )
+        bad_missing = [k for k in missing if not k.startswith(allowed_missing_prefixes)]
+        bad_unexpected = [k for k in unexpected if not k.startswith("head.")]
+        if bad_missing or bad_unexpected:
+            raise RuntimeError(
+                "Incompatible checkpoint state_dict. "
+                f"Missing keys: {bad_missing}; Unexpected keys: {bad_unexpected}"
+            )
+
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path) -> "BatesSurrogate":
         """Reconstructs model from a training checkpoint dict."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         cfg  = ckpt["config"]
         model = cls(
-            n_params  = cfg.get("n_params",  10),
+            n_params  = cfg.get("n_params",  7),
             n_outputs = cfg.get("n_outputs", 686),
             width     = cfg.get("width",     512),
             n_blocks  = cfg.get("n_blocks",  6),
+            nk        = cfg.get("nk",        49),
+            nt        = cfg.get("nt",        14),
+            rank      = cfg.get("rank",      24),
+            dropout   = cfg.get("dropout",   0.10),
         )
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_compatible_state_dict(ckpt["model_state_dict"])
         return model
 
 
@@ -234,7 +343,7 @@ if __name__ == "__main__":
     print(f"Parameters: {model.n_parameters():,}")
     print(f"Grid: NK={grid.NK}, NT={grid.NT}, N_FLAT={grid.N_FLAT}")
 
-    x  = torch.rand(4, 10)
+    x  = torch.rand(4, 7)
     out = model(x)
     print(f"Input shape:  {x.shape}")
     print(f"Output shape: {out.shape}")

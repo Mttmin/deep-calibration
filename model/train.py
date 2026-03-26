@@ -514,6 +514,10 @@ def main() -> None:
                     help="Directory for checkpoints and training log")
     ap.add_argument("--width",       type=int,   default=512)
     ap.add_argument("--n-blocks",    type=int,   default=6)
+    ap.add_argument("--rank",        type=int,   default=24,
+                    help="Low-rank dimension for grid factorized head")
+    ap.add_argument("--dropout",     type=float, default=0.10,
+                    help="Dropout used in trunk and heads")
     ap.add_argument("--batch-size",  type=int,   default=8196)
     ap.add_argument("--epochs",      type=int,   default=200)
     ap.add_argument("--lr",          type=float, default=1e-3)
@@ -586,6 +590,10 @@ def main() -> None:
         n_outputs = grid.N_FLAT,
         width     = args.width,
         n_blocks  = args.n_blocks,
+        nk        = grid.NK,
+        nt        = grid.NT,
+        rank      = args.rank,
+        dropout   = args.dropout,
     )
     model = BatesSurrogate(**model_config).to(device)
     print(f"[model] {model.n_parameters():,} parameters")
@@ -608,7 +616,7 @@ def main() -> None:
     # Resume
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_compatible_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch  = ckpt["epoch"] + 1

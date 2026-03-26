@@ -1,11 +1,11 @@
 """
 model/network.py
 ================
-BatesSurrogate  —  feedforward IV-surface surrogate for the Bates (SVJ) model.
+HestonSurrogate  —  feedforward IV-surface surrogate for the Heston (1993) model.
 
 Architecture (default):
-  Input  θ : (B, 10)   8 Bates params + r + q, all normalised to [0, 1]
-  Stem      : Linear(10→512) → LayerNorm → SiLU
+  Input  θ : (B, 7)    5 Heston params + r + q, all normalised to [0, 1]
+  Stem      : Linear(7→512) → LayerNorm → SiLU
   Body      : 6 × ResBlock(512)  [pre-norm, skip + SiLU]
   Head      : Linear(512→686) → softplus(β=3) + 0.01
   Output    : (B, 686)  implied volatilities ∈ (0.01, ~3.0)
@@ -93,6 +93,24 @@ class GridConstants:
 # Building blocks
 # ---------------------------------------------------------------------------
 
+
+class SwiGLU(nn.Module):
+    """SwiGLU module suitable for nn.Sequential.
+
+    Expects last-dimension to be 2 * dim; returns SiLU(a) * b (dim).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = x.chunk(2, dim=-1)
+        return F.silu(a) * b
+
+
+def swiglu(x: torch.Tensor) -> torch.Tensor:
+    """Functional SwiGLU: splits the last dim in half and applies gating.
+    """
+    a, b = x.chunk(2, dim=-1)
+    return F.silu(a) * b
+
 class ResBlock(nn.Module):
     """
     Pre-norm residual block:
@@ -109,12 +127,13 @@ class ResBlock(nn.Module):
     def __init__(self, width: int) -> None:
         super().__init__()
         self.ln  = nn.LayerNorm(width)
-        self.fc1 = nn.Linear(width, width)
+        self.fc1 = nn.Linear(width, width * 2)
         self.fc2 = nn.Linear(width, width)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.ln(x)
-        h = F.silu(self.fc1(h))
+        h = self.fc1(h)
+        h = swiglu(h)
         h = self.fc2(h)
         return F.silu(x + h)
 
@@ -141,7 +160,7 @@ class BatesSurrogate(nn.Module):
 
     def __init__(
         self,
-        n_params: int = 10,
+        n_params: int = 7,
         n_outputs: int = 686,
         width: int = 512,
         n_blocks: int = 6,
@@ -154,11 +173,13 @@ class BatesSurrogate(nn.Module):
 
         # Stem: project input to hidden width
         self.stem = nn.Sequential(
-            nn.Linear(n_params, width),
-            nn.LayerNorm(width),
-            nn.SiLU(),
+            nn.Linear(n_params, width * 2),
+            nn.LayerNorm(width * 2),
+            SwiGLU(),
+            # dropout
+            nn.Dropout(0.1),
         )
-
+        
         # Body: residual blocks
         self.blocks = nn.ModuleList([ResBlock(width) for _ in range(n_blocks)])
 

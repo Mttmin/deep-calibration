@@ -59,6 +59,7 @@ from model.loss import (
     compute_vega_weights,
     ivrmse_bps,
     total_loss,
+    dual_head_loss,
 )
 
 # BatesDataset lives in the data-generation script
@@ -345,6 +346,8 @@ def train_one_epoch(
     grad_clip:   float,
     device:      torch.device,
     time_batches: bool = False,
+    use_dual_head: bool = False,
+    lambda_param: float = 0.1,
 ) -> dict[str, float]:
     model.train()
 
@@ -376,6 +379,8 @@ def train_one_epoch(
         h2d_s += h2d_t1 - h2d_t0
 
         # Denormalise r and q for vega weight computation
+        # Note: r and q are market observables (not calibration parameters)
+        # They flow through the network but are NOT predicted by the parameter head
         compute_t0 = time.perf_counter()
         r = params_norm[:, 5] * 0.06   # r at index 5 (5 Heston params then r, q)
         q = params_norm[:, 6] * 0.04   # q at index 6
@@ -385,14 +390,29 @@ def train_one_epoch(
 
         # Forward pass in BF16
         with amp.autocast("cuda", dtype=torch.bfloat16):
-            iv_pred = model(params_norm)
+            if use_dual_head:
+                iv_pred, param_pred = model.forward_dual(params_norm)
+            else:
+                iv_pred = model(params_norm)
 
         # Loss in FP32 (cast iv_pred here; grid passed directly)
-        bd = total_loss(
-            iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
-            lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
-            confidence=conf_flat,
-        )
+        if use_dual_head:
+            # Extract 5 Heston parameters only (first 5 of the 7: 5 Heston + r + q)
+            # The parameter head learns to predict ONLY the Heston params; r and q are market inputs
+            param_target = params_norm[:, :5]
+            bd = dual_head_loss(
+                iv_pred.float(), param_pred.float(), iv_flat, param_target,
+                mask_flat, vega_w, grid,
+                lambda_param=lambda_param,
+                lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                confidence=conf_flat,
+            )
+        else:
+            bd = total_loss(
+                iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
+                lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                confidence=conf_flat,
+            )
 
         scaler.scale(bd.total).backward()
         scaler.unscale_(optimizer)
@@ -430,6 +450,8 @@ def validate(
     lambda_cal:  float,
     lambda_bfly: float,
     device:      torch.device,
+    use_dual_head: bool = False,
+    lambda_param: float = 0.1,
 ) -> dict[str, float]:
     model.eval()
 
@@ -447,12 +469,23 @@ def validate(
         q = params_norm[:, 6] * 0.04
 
         vega_w  = compute_vega_weights(iv_flat, grid, r, q)
-        iv_pred = model(params_norm)
 
-        bd = total_loss(
-            iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
-            lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
-        )
+        if use_dual_head:
+            iv_pred, param_pred = model.forward_dual(params_norm)
+            # Parameter head predicts ONLY 5 Heston params; r and q are market inputs, not learned
+            param_target = params_norm[:, :5]
+            bd = dual_head_loss(
+                iv_pred.float(), param_pred.float(), iv_flat, param_target,
+                mask_flat, vega_w, grid,
+                lambda_param=lambda_param,
+                lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+            )
+        else:
+            iv_pred = model(params_norm)
+            bd = total_loss(
+                iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
+                lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+            )
 
         sums["total"]     += bd.total.item()
         sums["vega"]      += bd.vega.item()
@@ -544,6 +577,10 @@ def main() -> None:
     ap.add_argument("--time-batches", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="Measure DataLoader wait, host-to-device copy, and compute time per batch")
+    ap.add_argument("--use-dual-head", action="store_true",
+                    help="Enable dual-head training with parameter predictions for identifiability")
+    ap.add_argument("--lambda-param", type=float, default=0.1,
+                    help="Weight for parameter MSE term in dual-head loss (default 0.1)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -666,9 +703,13 @@ def main() -> None:
             model, train_loader, optimizer, scaler,
             grid, lam_cal, lam_bfly, args.grad_clip, device,
             time_batches=args.time_batches,
+            use_dual_head=args.use_dual_head,
+            lambda_param=args.lambda_param,
         )
         val_m = validate(
             model, val_loader, grid, lam_cal, lam_bfly, device,
+            use_dual_head=args.use_dual_head,
+            lambda_param=args.lambda_param,
         )
 
         # Adaptive PINN cap: if PINN/vega > 10, halve lambda targets

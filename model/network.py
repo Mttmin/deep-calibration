@@ -185,13 +185,21 @@ class GridFactorizedHead(nn.Module):
 
 class BatesSurrogate(nn.Module):
     """
-    Feedforward pricing surrogate θ -> Sigma(theta).
+    Feedforward pricing surrogate θ -> (Sigma(theta), theta_aux).
 
-    Maps parameter vectors (default 7: 5 Heston + r + q, all normalised to
-    [0, 1]) to a flattened IV surface. The default output size is 686 (49 x 14).
+    Maps Heston parameter vectors (5: kappa, theta, sigma, rho, v0, all normalised to
+    [0, 1]) to both:
+      1. Flattened IV surface (686 = 49 × 14)
+      2. Auxiliary parameter predictions (5 Heston, for regularization during calibration)
+
+    Risk-free rate (r) and dividend yield (q) are market observables, not calibration
+    parameters. They are applied separately during pricing, not part of the model input.
+
+    Dual-head architecture improves parameter identifiability by constraining
+    the latent representations to preserve the input-parameter relationship.
 
     Args:
-        n_params:  Input dimension.  Default 10 (8 Bates + r + q).
+        n_params:  Input dimension.  Default 5 (5 Heston: kappa, theta, sigma, rho, v0).
         n_outputs: Output dimension. Default 686 (49 × 14).
         width:     Hidden width.     Default 512.
         n_blocks:  Residual blocks.  Default 6.
@@ -202,7 +210,7 @@ class BatesSurrogate(nn.Module):
 
     def __init__(
         self,
-        n_params: int = 7,
+        n_params: int = 5,
         n_outputs: int = 686,
         width: int = 512,
         n_blocks: int = 6,
@@ -246,6 +254,19 @@ class BatesSurrogate(nn.Module):
             nn.Linear(width, n_outputs),
         )
 
+        # Auxiliary parameter prediction head (dual-head for identifiability).
+        # Predicts the 5 Heston parameters [kappa, theta, sigma, rho, v0] in [0,1].
+        # During training, this guides the latent representation toward meaningful
+        # parameter space, improving calibration robustness.
+        self.param_head = nn.Sequential(
+            nn.LayerNorm(width),
+            nn.Linear(width, width // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(width // 2, 5),  # Output 5 Heston parameters
+            nn.Sigmoid(),  # Normalize to [0, 1]
+        )
+
         # Weight initialisation (PyTorch defaults are Xavier uniform for Linear,
         # which is fine; we tweak the final head to start near a plausible IV)
         for layer in [
@@ -264,8 +285,17 @@ class BatesSurrogate(nn.Module):
         nn.init.zeros_(final.bias)
         nn.init.xavier_uniform_(final.weight, gain=0.1)
 
+        # Initialize param_head to output ~0.5 (center of [0,1])
+        param_final = self.param_head[-2]  # Linear layer before Sigmoid
+        if not isinstance(param_final, nn.Linear):
+            raise TypeError("param_head linear layer not found")
+        nn.init.zeros_(param_final.bias)
+        nn.init.xavier_uniform_(param_final.weight, gain=0.1)
+
     def forward(self, theta: torch.Tensor) -> torch.Tensor:
         """
+        Main forward pass: returns IV surface only.
+
         Args:
             theta: (B, n_params) float32 or bfloat16, values in [0, 1].
         Returns:
@@ -278,6 +308,27 @@ class BatesSurrogate(nn.Module):
         # softplus(β=3) is a smooth, everywhere-differentiable lower bound;
         # + 0.01 ensures IVs never collapse to zero during early training.
         return F.softplus(raw, beta=3) + 0.01
+
+    def forward_dual(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Dual-head forward pass: returns both IV surface and parameter predictions.
+
+        Used during training to improve parameter identifiability.
+
+        Args:
+            theta: (B, n_params) float32 or bfloat16, values in [0, 1].
+        Returns:
+            (iv_pred, param_pred):
+              - iv_pred: (B, n_outputs) implied volatilities
+              - param_pred: (B, 5) predicted Heston parameters in [0, 1]
+        """
+        x = self.stem(theta)
+        for block in self.blocks:
+            x = block(x)
+        raw = self.grid_head(x) + self.residual_head(x)
+        iv_pred = F.softplus(raw, beta=3) + 0.01
+        param_pred = self.param_head(x)
+        return iv_pred, param_pred
 
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -299,12 +350,13 @@ class BatesSurrogate(nn.Module):
 
         missing, unexpected = self.load_state_dict(sd, strict=False)
 
-        # Allow missing grid-head parameters when loading legacy checkpoints.
+        # Allow missing grid-head, residual-head, and param-head parameters when loading legacy checkpoints.
         allowed_missing_prefixes = (
             "grid_head.",
             "residual_head.0.",
             "residual_head.1.",
             "residual_head.3.",
+            "param_head.",  # New dual-head; old checkpoints won't have it
         )
         bad_missing = [k for k in missing if not k.startswith(allowed_missing_prefixes)]
         bad_unexpected = [k for k in unexpected if not k.startswith("head.")]

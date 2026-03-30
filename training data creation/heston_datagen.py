@@ -886,14 +886,15 @@ class BatesDataset(torch.utils.data.Dataset):
         j = int(self.idx[i])
 
         params = self._h5["params"][j].astype(np.float32)        # type: ignore  (N_PARAMS,)
-        rq     = self._h5["market_params"][j].astype(np.float32) # type: ignore  (2,)
+        # Market params (r, q) are known from market data, not calibrated parameters
+        # Only return the 5 Heston parameters for the model input
         iv     = self._h5["iv_surface"][j].astype(np.float32)    # type: ignore  (NK, NT)
         mask   = self._h5["cell_mask"][j]                         # type: ignore  (NK, NT) bool
 
-        # Normalize params and market params to [0, 1]
+        # Normalize Heston params to [0, 1]
         params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
-        rq     = (rq - self.market_lo) / (self.market_hi - self.market_lo + 1e-12)
-        all_params = np.concatenate([params, rq])  # (N_PARAMS+2,)
+        # Pure Heston: 5 parameters only (no r/q concatenation)
+        all_params = params  # (N_PARAMS,) = (5,)
 
         # Replace NaN with 0 in iv (loss will mask these out anyway)
         iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]

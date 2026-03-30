@@ -327,6 +327,76 @@ def total_loss(
 
 
 # ---------------------------------------------------------------------------
+# Dual-head loss: IV + parameter prediction (for identifiability)
+# ---------------------------------------------------------------------------
+
+def dual_head_loss(
+    iv_pred:       torch.Tensor,   # (B, N_FLAT)  float32 or bf16
+    param_pred:    torch.Tensor,   # (B, 5)       float32 or bf16 — 5 Heston params
+    iv_target:     torch.Tensor,   # (B, N_FLAT)  float32
+    param_target:  torch.Tensor,   # (B, 5)       float32 — 5 Heston params in [0,1]
+    mask:          torch.Tensor,   # (B, N_FLAT)  bool
+    weights:       torch.Tensor,   # (B, N_FLAT)  float32  vega weights
+    grid:          GridConstants,
+    lambda_param:  float = 0.1,
+    lambda_cal:    float = 0.1,
+    lambda_bfly:   float = 0.05,
+    confidence:    torch.Tensor | None = None,
+) -> LossBreakdown:
+    """
+    Combined dual-head training loss:
+
+        L = L_vega  +  λ_param · L_param  +  λ_cal · L_calendar  +  λ_bfly · L_butterfly
+
+    The auxiliary parameter prediction head helps disambiguate the parameter space
+    when calibrating from IV surfaces, improving robustness to local minima.
+
+    Training with parameter supervision ensures the network learns the inverse
+    mapping: IV surface → 5 Heston parameters. This guides calibration toward
+    physically meaningful solutions.
+
+    Args:
+        iv_pred:       IV surface predictions (B, N_FLAT).
+        param_pred:    Heston parameter predictions (B, 5) from auxiliary head.
+                       Expected: [kappa, theta, sigma, rho, v0], all in [0,1].
+        iv_target:     Ground-truth IV surface (B, N_FLAT).
+        param_target:  Ground-truth Heston parameters (B, 5) normalised to [0,1].
+        mask:          Valid-cell boolean mask (B, N_FLAT).
+        weights:       Precomputed vega weights (B, N_FLAT).
+        grid:          GridConstants.
+        lambda_param:  Weight for parameter MSE term. Default 0.1.
+        lambda_cal:    Weight for calendar-spread PINN. Default 0.1.
+        lambda_bfly:   Weight for butterfly PINN. Default 0.05.
+        confidence:    Optional per-cell confidence weights.
+
+    Returns:
+        LossBreakdown(total, vega, calendar, butterfly).
+        Note: The 'vega' field includes IV MSE; parameter MSE is implicit in total.
+    """
+    # IV loss (as before)
+    l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
+
+    # Parameter MSE loss (L2 distance between predicted and true Heston params)
+    param_pred_f = param_pred.float()
+    param_target_f = param_target.float()
+    l_param = F.mse_loss(param_pred_f, param_target_f)
+
+    # PINN penalties (as before)
+    l_cal = calendar_spread_penalty(iv_pred, grid, mask)
+    l_bfly = durrleman_butterfly_penalty(iv_pred, grid, mask)
+
+    # Combined loss with parameter regularization
+    l_total = l_vega + lambda_param * l_param + lambda_cal * l_cal + lambda_bfly * l_bfly
+
+    return LossBreakdown(
+        total=l_total,
+        vega=l_vega,  # Contains IV MSE; param MSE is implicit in l_total
+        calendar=l_cal,
+        butterfly=l_bfly,
+    )
+
+
+# ---------------------------------------------------------------------------
 # IV RMSE in basis points  (reporting metric)
 # ---------------------------------------------------------------------------
 

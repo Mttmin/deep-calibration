@@ -41,28 +41,19 @@ from .loss import compute_vega_weights, ivrmse_bps
 # Parameter bounds
 # ---------------------------------------------------------------------------
 
-# Physical bounds match PARAM_BOUNDS in heston_datagen.py
-# Row order: kappa, theta, sigma_v, rho, v0, lambda_j, mu_j, sigma_j, r, q
+# Physical bounds match PARAM_BOUNDS in heston_datagen.py (pure Heston, 5 params)
 PARAM_BOUNDS_PHYSICAL = torch.tensor(
     [
-        [0.10, 10.0],    # kappa
-        [0.02,  0.25],   # theta
-        [0.05,  2.00],   # sigma_v
+        [0.30,  8.00],   # kappa
+        [0.02,  0.12],   # theta
+        [0.05,  1.20],   # sigma_v
         [-0.98,  0.10],  # rho
-        [0.02,  0.25],   # v0
-        [0.00,  4.00],   # lambda_j
-        [-0.30,  0.00],  # mu_j
-        [0.01,  0.45],   # sigma_j
-        [0.00,  0.06],   # r
-        [0.00,  0.04],   # q
+        [0.02,  0.12],   # v0
     ],
     dtype=torch.float32,
 )
 
-PARAM_NAMES = [
-    "kappa", "theta", "sigma_v", "rho", "v0",
-    "lambda_j", "mu_j", "sigma_j", "r", "q",
-]
+PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0"]
 
 # Wing clipping bounds for calibration active zone (Change 4)
 # Cells with log-moneyness outside [WING_LO, WING_HI] are zeroed from eff_w.
@@ -73,12 +64,12 @@ WING_HI: float =  0.30
 
 def denormalize(theta_norm: torch.Tensor) -> torch.Tensor:
     """
-    Maps normalised parameters from [0,1]^10 to physical units.
+    Maps normalised parameters from [0,1]^5 to physical units.
 
     Args:
-        theta_norm: (..., 10) float32 in [0, 1].
+        theta_norm: (..., 5) float32 in [0, 1].
     Returns:
-        theta_raw:  (..., 10) float32 in physical units.
+        theta_raw:  (..., 5) float32 in physical units.
     """
     bounds = PARAM_BOUNDS_PHYSICAL.to(theta_norm.device)
     lo = bounds[:, 0]
@@ -88,12 +79,12 @@ def denormalize(theta_norm: torch.Tensor) -> torch.Tensor:
 
 def normalize(theta_raw: torch.Tensor) -> torch.Tensor:
     """
-    Maps physical parameters to normalised [0,1]^10 space.
+    Maps physical parameters to normalised [0,1]^5 space.
 
     Args:
-        theta_raw: (..., 10) float32 in physical units.
+        theta_raw: (..., 5) float32 in physical units.
     Returns:
-        theta_norm: (..., 10) float32 in [0, 1].
+        theta_norm: (..., 5) float32 in [0, 1].
     """
     bounds = PARAM_BOUNDS_PHYSICAL.to(theta_raw.device)
     lo = bounds[:, 0]

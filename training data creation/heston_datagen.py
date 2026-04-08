@@ -118,6 +118,12 @@ PARAM_BOUNDS: np.ndarray = np.array([
     [0.05, 1.20],    # σ_v  vol-of-vol
     [-0.98, 0.10],   # ρ    equity skew almost always negative
     [0.02, 0.12],    # v₀   initial variance  (σ₀  ∈ [14%, 35%])
+    # TODO(deep-cal): retrain with more realistic equity-market bounds once the
+    # current surrogate is validated end-to-end.  Recommended target:
+    #   κ ∈ [0.5, 8.0], θ ∈ [0.01, 0.10], σ_v ∈ [0.10, 1.00],
+    #   ρ ∈ [-0.95, 0.0], v₀ ∈ [0.01, 0.10]
+    # These tighter bounds reduce training variance and align the surrogate
+    # with typical SPX/SPY calibrations outside crisis regimes.
 ], dtype=np.float64)
 PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0"]
 N_PARAMS: int = len(PARAM_NAMES)  # 5
@@ -525,7 +531,15 @@ def generate(
     guided_bank_path: str | None = None,
     guided_weight: float = 0.0,
     guided_jitter: float = 0.04,
+    n_rq_chunks:   int | None = None,
 ) -> None:
+    """
+    n_rq_chunks: number of distinct (r, q) regimes used across all chunks.
+    Each chunk is assigned one (r, q) pair; pairs are drawn from a Sobol
+    sequence so they cover [R_BOUNDS × Q_BOUNDS] quasi-uniformly.
+    Default: max(1000, n_chunks) — many more than the number of chunks so
+    every chunk gets a unique (r, q).
+    """
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[device] {dev}" + (
         f"  ({torch.cuda.get_device_name(0)})" if dev.type == "cuda" else ""
@@ -553,12 +567,32 @@ def generate(
     Vk        = cos_call_Vk(dev)                                  # (Nc,)  float64
     is_put    = torch.tensor(IS_PUT_SIDE, device=dev)             # (NK,)  bool
 
-    # RNG for per-chunk r, q sampling
-    rng = np.random.default_rng(seed + 7777)
-
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     n_chunks = math.ceil(N / chunk_size)
+
+    # Pre-generate a Sobol sequence of (r, q) pairs for well-distributed market
+    # environment coverage.  Each chunk is assigned one pair, so every forward
+    # pass uses a distinct (r, q) regime.  With chunk_size << N the network sees
+    # enough distinct (r, q) values to avoid specialising to a few regimes.
+    #
+    # Preserve the GEMM decomposition in cos_call_prices: r and q must be scalar
+    # per batch (all B samples share the same r, q within a chunk).
+    n_rq = max(n_rq_chunks if n_rq_chunks is not None else 0, max(1000, n_chunks))
+    rq_sampler = qmc.Sobol(d=2, scramble=True, seed=seed + 3141)
+    n_rq_raw   = int(2 ** math.ceil(math.log2(max(2, n_rq))))
+    rq_raw     = rq_sampler.random(n_rq_raw)[:n_rq]              # (n_rq, 2) in [0,1]
+    rq_scaled  = qmc.scale(rq_raw, [R_BOUNDS[0], Q_BOUNDS[0]], [R_BOUNDS[1], Q_BOUNDS[1]])
+    # Assign one (r, q) pair to each chunk (cycling if n_rq < n_chunks)
+    rng = np.random.default_rng(seed + 7777)
+    rq_order   = rng.permutation(n_rq)                           # shuffle for randomness
+    chunk_rq   = rq_scaled[rq_order % n_rq]                     # (n_rq, 2), indexed per chunk
+
+    print(
+        f"[rq-diversity]  n_chunks={n_chunks}  n_rq_distinct={n_rq}  "
+        f"r∈[{R_BOUNDS[0]:.2f},{R_BOUNDS[1]:.2f}]  "
+        f"q∈[{Q_BOUNDS[0]:.2f},{Q_BOUNDS[1]:.2f}]"
+    )
 
     with h5py.File(out, "w") as f:
         total_cells = NK * NT
@@ -620,9 +654,12 @@ def generate(
             i1 = min(i0 + chunk_size, N)
             B  = i1 - i0
 
-            # Sample r, q per-chunk (all B samples share same r, q)
-            r = float(rng.uniform(*R_BOUNDS))
-            q = float(rng.uniform(*Q_BOUNDS))
+            # Assign pre-generated Sobol (r, q) pair for this chunk.
+            # All B samples share the same r, q (required for GEMM decomposition
+            # in cos_call_prices).  Cycling over n_rq ensures variety even when
+            # n_chunks > n_rq.
+            r = float(chunk_rq[ci % n_rq, 0])
+            q = float(chunk_rq[ci % n_rq, 1])
 
             params_t = torch.tensor(params_np[i0:i1], device=dev, dtype=torch.float64)
             iv_chunk = torch.full((B, NK, NT), float("nan"),
@@ -837,7 +874,7 @@ class BatesDataset(torch.utils.data.Dataset):
 
         params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
         rq     = (rq - self.market_lo) / (self.market_hi - self.market_lo + 1e-12)
-        all_params = np.concatenate([params, rq], axis=1)
+        all_params = params  # (N, 5) Pure Heston, no r/q concatenation
         iv[~mask] = 0.0
 
         self.params_tensor = torch.from_numpy(all_params)
@@ -949,6 +986,9 @@ if __name__ == "__main__":
                     help="Fraction of samples drawn from guided param bank")
     ap.add_argument("--guided-jitter", type=float, default=0.04,
                     help="Relative jitter scale applied to guided params")
+    ap.add_argument("--rq-chunks", type=int, default=None,
+                    help="Number of distinct (r,q) regimes to use (default: max(1000, n_chunks)). "
+                         "Pre-generated via Sobol for quasi-uniform coverage of market environments.")
     ap.add_argument("--val",   action="store_true",
                     help="200k val set (seed+9999, appends _val.h5)")
     ap.add_argument("--check", action="store_true",
@@ -970,10 +1010,12 @@ if __name__ == "__main__":
                  chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy,
                  guided_bank_path=args.guided_bank,
                  guided_weight=args.guided_weight,
-                 guided_jitter=args.guided_jitter)
+                 guided_jitter=args.guided_jitter,
+                 n_rq_chunks=args.rq_chunks)
     else:
         generate(N=args.N, output_path=args.out, seed=args.seed,
                  chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy,
                  guided_bank_path=args.guided_bank,
                  guided_weight=args.guided_weight,
-                 guided_jitter=args.guided_jitter)
+                 guided_jitter=args.guided_jitter,
+                 n_rq_chunks=args.rq_chunks)

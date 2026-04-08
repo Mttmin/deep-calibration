@@ -382,8 +382,12 @@ def train_one_epoch(
         # Note: r and q are market observables (not calibration parameters)
         # They flow through the network but are NOT predicted by the parameter head
         compute_t0 = time.perf_counter()
-        r = params_norm[:, 5] * 0.06   # r at index 5 (5 Heston params then r, q)
-        q = params_norm[:, 6] * 0.04   # q at index 6
+        if params_norm.shape[1] > 6:
+            r = params_norm[:, 5] * 0.06   # r at index 5 (5 Heston params then r, q)
+            q = params_norm[:, 6] * 0.04   # q at index 6
+        else:
+            r = torch.zeros(params_norm.shape[0], device=params_norm.device)
+            q = torch.zeros(params_norm.shape[0], device=params_norm.device)
 
         # Vega weights: computed in float32 on the ground-truth IV
         vega_w = compute_vega_weights(iv_flat, grid, r, q)
@@ -465,8 +469,12 @@ def validate(
         iv_flat     = batch[1].to(device, non_blocking=True)
         mask_flat   = batch[2].to(device, non_blocking=True)
 
-        r = params_norm[:, 5] * 0.06
-        q = params_norm[:, 6] * 0.04
+        if params_norm.shape[1] > 6:
+            r = params_norm[:, 5] * 0.06
+            q = params_norm[:, 6] * 0.04
+        else:
+            r = torch.zeros(params_norm.shape[0], device=params_norm.device)
+            q = torch.zeros(params_norm.shape[0], device=params_norm.device)
 
         vega_w  = compute_vega_weights(iv_flat, grid, r, q)
 
@@ -623,7 +631,7 @@ def main() -> None:
 
     # Model
     model_config = dict(
-        n_params  = 7,   # 5 Heston params + r + q
+        n_params  = 5,   # 5 Heston params (kappa, theta, sigma, rho, v0)
         n_outputs = grid.N_FLAT,
         width     = args.width,
         n_blocks  = args.n_blocks,
@@ -725,7 +733,7 @@ def main() -> None:
                       f"λ_bfly→{lambda_bfly_target:.4f}")
 
         lr_now = optimizer.param_groups[0]["lr"]
-        val_monitor = val_m["total"]
+        val_monitor = val_m["vega"]
         scheduler.step(val_monitor)
 
         ivrmse = val_m["ivrmse_bps"]

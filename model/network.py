@@ -372,7 +372,7 @@ class BatesSurrogate(nn.Module):
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         cfg  = ckpt["config"]
         model = cls(
-            n_params  = cfg.get("n_params",  7),
+            n_params  = cfg.get("n_params",  5),
             n_outputs = cfg.get("n_outputs", 686),
             width     = cfg.get("width",     512),
             n_blocks  = cfg.get("n_blocks",  6),

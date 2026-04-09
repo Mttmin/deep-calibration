@@ -210,7 +210,7 @@ class BatesSurrogate(nn.Module):
 
     def __init__(
         self,
-        n_params: int = 5,
+        n_params: int = 6,
         n_outputs: int = 686,
         width: int = 512,
         n_blocks: int = 6,
@@ -383,6 +383,92 @@ class BatesSurrogate(nn.Module):
         )
         model.load_compatible_state_dict(ckpt["model_state_dict"])
         return model
+
+
+# ---------------------------------------------------------------------------
+# PINN LoRA adapter
+# ---------------------------------------------------------------------------
+
+class PINNAdapter(nn.Module):
+    """
+    Low-rank residual correction for PINN fine-tuning.
+
+    Intended use: after training a base BatesSurrogate with --no-pinn, freeze
+    the base model and train only this adapter with PINN (calendar + butterfly)
+    constraints.  The adapter applies a small learned correction to the base
+    IV surface without touching the surrogate weights.
+
+    Forward:
+        iv_corrected = iv_base + up(silu(down(iv_base)))
+
+    where down: N_FLAT → rank  and  up: rank → N_FLAT.
+    Initialised so the correction starts near zero (identity pass-through).
+
+    Args:
+        n_flat: IV surface size (default 686 = 49 × 14).
+        rank:   Bottleneck rank.  Larger = more capacity; 32–64 is usually enough.
+    """
+
+    def __init__(self, n_flat: int = 686, rank: int = 32) -> None:
+        super().__init__()
+        self.down = nn.Linear(n_flat, rank, bias=True)
+        self.up   = nn.Linear(rank, n_flat, bias=False)
+
+        nn.init.xavier_uniform_(self.down.weight, gain=0.01)
+        nn.init.zeros_(self.down.bias)
+        nn.init.zeros_(self.up.weight)  # start as identity (zero correction)
+
+    def forward(self, iv: torch.Tensor) -> torch.Tensor:
+        return iv + self.up(F.silu(self.down(iv)))
+
+    def n_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class BatesSurrogateWithPINN(nn.Module):
+    """
+    Combines a frozen BatesSurrogate base with a trainable PINNAdapter.
+
+    Used during PINN fine-tuning: the base model is loaded from a checkpoint
+    and its parameters are frozen; only the adapter is updated.
+
+    At export time this class is traced as a single ONNX model so the Rust
+    inference code requires no changes.
+    """
+
+    def __init__(self, base: "BatesSurrogate", adapter: PINNAdapter) -> None:
+        super().__init__()
+        self.base    = base
+        self.adapter = adapter
+
+    def forward(self, theta: torch.Tensor) -> torch.Tensor:
+        iv_base = self.base(theta)
+        return self.adapter(iv_base)
+
+    def freeze_base(self) -> None:
+        """Freeze all base model parameters; adapter remains trainable."""
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+
+    def unfreeze_base(self) -> None:
+        for p in self.base.parameters():
+            p.requires_grad_(True)
+
+    @classmethod
+    def from_checkpoints(
+        cls,
+        base_checkpoint: str | Path,
+        adapter_checkpoint: str | Path | None = None,
+        rank: int = 32,
+    ) -> "BatesSurrogateWithPINN":
+        """Load base from checkpoint and optionally restore a saved adapter."""
+        base    = BatesSurrogate.from_checkpoint(base_checkpoint)
+        n_flat  = base.n_outputs
+        adapter = PINNAdapter(n_flat=n_flat, rank=rank)
+        if adapter_checkpoint is not None:
+            ckpt = torch.load(adapter_checkpoint, map_location="cpu", weights_only=True)
+            adapter.load_state_dict(ckpt["adapter_state_dict"])
+        return cls(base, adapter)
 
 
 # ---------------------------------------------------------------------------

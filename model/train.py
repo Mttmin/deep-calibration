@@ -46,6 +46,7 @@ import time
 from pathlib import Path
 
 import h5py
+import numpy as np
 import torch
 import torch.amp as amp
 from torch.utils.data import DataLoader
@@ -126,8 +127,13 @@ def _estimate_split_bytes(
     val_frac: float,
     val_h5: str | None,
     train_confidence: bool,
+    sample_frac: float = 1.0,
 ) -> tuple[int, int]:
+    if not (0.0 < sample_frac <= 1.0):
+        raise ValueError(f"sample_frac must be in (0, 1], got {sample_frac}")
+
     n_total, nk, nt = _h5_shape(h5_path)
+    n_total = max(1, int(math.floor(n_total * sample_frac)))
     train_bps = _bytes_per_sample(nk, nt, include_confidence=train_confidence)
 
     if val_h5 is None:
@@ -137,6 +143,7 @@ def _estimate_split_bytes(
         return n_train * train_bps, n_val * val_bps
 
     n_val_total, nk_val, nt_val = _h5_shape(val_h5)
+    n_val_total = max(1, int(math.floor(n_val_total * sample_frac)))
     val_bps = _bytes_per_sample(nk_val, nt_val, include_confidence=False)
     return n_total * train_bps, n_val_total * val_bps
 
@@ -147,8 +154,15 @@ def resolve_auto_preload(
     val_h5: str | None,
     train_confidence: bool,
     device: torch.device,
+    sample_frac: float = 1.0,
 ) -> tuple[str, str, str]:
-    train_bytes, val_bytes = _estimate_split_bytes(h5_path, val_frac, val_h5, train_confidence)
+    train_bytes, val_bytes = _estimate_split_bytes(
+        h5_path,
+        val_frac,
+        val_h5,
+        train_confidence,
+        sample_frac=sample_frac,
+    )
     total_bytes = train_bytes + val_bytes
 
     vram_free = _available_vram_bytes(device)
@@ -183,6 +197,7 @@ def build_dataloaders(
     val_frac: float = 0.10,
     val_h5: str | None = None,
     seed: int = 42,
+    sample_frac: float = 1.0,
     preload: str = "none",
     train_preload_device: str = "cpu",
     val_preload_device: str = "cpu",
@@ -200,6 +215,8 @@ def build_dataloaders(
     """
     if preload not in {"none", "train", "all"}:
         raise ValueError(f"Unknown preload mode: {preload}")
+    if not (0.0 < sample_frac <= 1.0):
+        raise ValueError(f"sample_frac must be in (0, 1], got {sample_frac}")
 
     if train_preload_device not in {"cpu", "cuda"}:
         raise ValueError(f"Unknown train preload device: {train_preload_device}")
@@ -211,6 +228,15 @@ def build_dataloaders(
 
     meta_ds = BatesDataset(h5_path, min_valid_cells=None, preload=False)
     N       = len(meta_ds)
+
+    rng = np.random.default_rng(seed)
+
+    def _sample_indices(indices: np.ndarray) -> np.ndarray:
+        if sample_frac >= 1.0:
+            return indices
+        n_keep = max(1, int(math.floor(len(indices) * sample_frac)))
+        choice = rng.choice(len(indices), size=n_keep, replace=False)
+        return indices[np.sort(choice)]
 
     def _build_with_fallback(base_kwargs: dict, split_name: str, preload_now: bool, preload_device_now: str):
         kwargs = dict(base_kwargs)
@@ -233,30 +259,39 @@ def build_dataloaders(
                 raise
 
     if val_h5 is not None:
+        train_positions = _sample_indices(np.arange(N, dtype=np.int64))
+        val_meta = BatesDataset(val_h5, min_valid_cells=None, preload=False)
+        n_val_total = len(val_meta)
+        val_positions = _sample_indices(np.arange(n_val_total, dtype=np.int64))
+
         train_ds, train_preload, train_preload_device = _build_with_fallback({
             "h5_path": h5_path,
             "min_valid_cells": 0,
+            "indices": train_positions,
             "return_confidence": return_confidence,
         }, "train", train_preload, train_preload_device)
         val_ds, val_preload, val_preload_device = _build_with_fallback({
             "h5_path": val_h5,
             "min_valid_cells": 0,
+            "indices": val_positions,
             "return_confidence": False,
         }, "val", val_preload, val_preload_device)
     else:
         n_val   = max(1, int(math.ceil(N * val_frac)))
         n_train = N - n_val
+        train_positions = _sample_indices(np.arange(0, n_train, dtype=np.int64))
+        val_positions = _sample_indices(np.arange(n_train, N, dtype=np.int64))
 
         train_ds, train_preload, train_preload_device = _build_with_fallback({
             "h5_path": h5_path,
             "min_valid_cells": 0,
-            "indices": range(n_train),
+            "indices": train_positions,
             "return_confidence": return_confidence,
         }, "train", train_preload, train_preload_device)
         val_ds, val_preload, val_preload_device = _build_with_fallback({
             "h5_path": h5_path,
             "min_valid_cells": 0,
-            "indices": range(n_train, N),
+            "indices": val_positions,
             "return_confidence": False,
         }, "val", val_preload, val_preload_device)
 
@@ -577,11 +612,32 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
     for epoch in range(args.epochs):
         combined.train()
         t0 = time.time()
-        for batch in train_loader:
+        batch_wait_s = 0.0
+        h2d_s = 0.0
+        compute_s = 0.0
+        n_steps = 0
+        train_vega_sum = 0.0
+
+        iterator = iter(train_loader)
+        while True:
+            wait_t0 = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
+            wait_t1 = time.perf_counter()
+            batch_wait_s += wait_t1 - wait_t0
+
+            h2d_t0 = time.perf_counter()
             params_norm = batch[0].to(device, non_blocking=True)
             iv_flat     = batch[1].to(device, non_blocking=True)
             mask_flat   = batch[2].to(device, non_blocking=True)
+            if args.time_batches and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            h2d_t1 = time.perf_counter()
+            h2d_s += h2d_t1 - h2d_t0
 
+            compute_t0 = time.perf_counter()
             optimizer.zero_grad()
             with amp.autocast("cuda", dtype=torch.bfloat16):
                 iv_pred = combined(params_norm)
@@ -598,10 +654,19 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
             torch.nn.utils.clip_grad_norm_(combined.adapter.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+            if args.time_batches and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            compute_t1 = time.perf_counter()
+            compute_s += compute_t1 - compute_t0
+            n_steps += 1
+            train_vega_sum += l_vega.item()
 
         # Validation
         combined.eval()
-        val_cal_sum = val_bfly_sum = val_n = 0.0
+        val_cal_sum = val_bfly_sum = val_vega_sum = 0.0
+        val_sq_err_sum = 0.0
+        val_valid_sum = 0.0
+        val_n = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 params_norm = batch[0].to(device, non_blocking=True)
@@ -610,17 +675,32 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
                 iv_pred = combined(params_norm)
                 val_cal_sum  += calendar_spread_penalty(iv_pred, grid, mask_flat).item()
                 val_bfly_sum += durrleman_butterfly_penalty(iv_pred, grid, mask_flat).item()
+                val_vega_batch = ((iv_pred.float() - iv_flat.float()) ** 2 * mask_flat.float()).sum(dim=1)
+                val_vega_batch = val_vega_batch / mask_flat.float().sum(dim=1).clamp(min=1.0)
+                val_vega_sum += val_vega_batch.mean().item()
+                m = mask_flat.float()
+                val_sq_err_sum += ((iv_pred.float() - iv_flat.float()) ** 2 * m).sum().item()
+                val_valid_sum += m.sum().item()
                 val_n += 1
 
+        train_vega = train_vega_sum / max(n_steps, 1)
         val_cal  = val_cal_sum  / max(val_n, 1)
         val_bfly = val_bfly_sum / max(val_n, 1)
+        val_vega = val_vega_sum / max(val_n, 1)
+        val_ivrmse_bps = math.sqrt(val_sq_err_sum / max(val_valid_sum, 1.0)) * 10_000.0
         val_monitor = args.lambda_cal * val_cal + args.lambda_bfly * val_bfly
         scheduler.step(val_monitor)
 
         lr_now = optimizer.param_groups[0]["lr"]
         print(
             f"epoch {epoch:4d}  lr={lr_now:.2e}  "
-            f"val_cal={val_cal:.6f}  val_bfly={val_bfly:.6f}  [{time.time()-t0:.1f}s]"
+            f"train_vega={train_vega:.6f}  "
+            f"val_vega={val_vega:.6f}  "
+            f"wait={1e3 * batch_wait_s / max(n_steps, 1):.2f}ms  "
+            f"h2d={1e3 * h2d_s / max(n_steps, 1):.2f}ms  "
+            f"compute={1e3 * compute_s / max(n_steps, 1):.2f}ms  "
+            f"val_ivrmse={val_ivrmse_bps:.2f} bps  "
+            f"[{time.time()-t0:.1f}s]"
         )
 
         if val_monitor < best_val_cal:
@@ -708,6 +788,11 @@ def main() -> None:
     resolved_preload = args.preload
     train_preload_device = "cpu"
     val_preload_device = "cpu"
+    # In PINN LoRA fine-tune mode, use a smaller subset by default to keep
+    # turnaround times practical while preserving the same epoch logging format.
+    sample_frac = 0.5 if args.pinn_finetune else 1.0
+    if args.pinn_finetune:
+        print("[pinn-finetune] using 50% random subset of train/val data")
     if args.preload == "auto":
         resolved_preload, train_preload_device, val_preload_device = resolve_auto_preload(
             h5_path=args.h5,
@@ -715,6 +800,7 @@ def main() -> None:
             val_h5=args.val_h5,
             train_confidence=args.confidence,
             device=device,
+            sample_frac=sample_frac,
         )
         print(
             f"[preload-auto] selected preload={resolved_preload} "
@@ -729,6 +815,7 @@ def main() -> None:
         val_frac          = args.val_frac,
         val_h5            = args.val_h5,
         seed              = args.seed,
+        sample_frac       = sample_frac,
         preload           = resolved_preload,
         train_preload_device = train_preload_device,
         val_preload_device   = val_preload_device,

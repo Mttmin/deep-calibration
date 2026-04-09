@@ -37,7 +37,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from model.network import BatesSurrogate
+from model.network import BatesSurrogate, BatesSurrogateWithPINN
 
 
 # ---------------------------------------------------------------------------
@@ -188,15 +188,25 @@ def export_onnx(
 # ---------------------------------------------------------------------------
 
 def load_and_export(
-    checkpoint_path: str | Path,
-    out_dir:         str | Path = "model/",
-    formats:         list[str]  | None = None,
+    checkpoint_path:  str | Path,
+    adapter_path:     str | Path | None = None,
+    lora_rank:        int = 32,
+    out_dir:          str | Path = "model/",
+    formats:          list[str]  | None = None,
 ) -> dict[str, str]:
     """
-    Load a training checkpoint, reconstruct BatesSurrogate, and export.
+    Load a training checkpoint (and optional PINN adapter), reconstruct the
+    model, and export to TorchScript and/or ONNX.
+
+    When `adapter_path` is provided, the base model is combined with the
+    PINNAdapter into a `BatesSurrogateWithPINN` before export.  The fused
+    model has the same forward signature (parameters → iv_surface) so the
+    Rust inference code requires no changes.
 
     Args:
-        checkpoint_path: Path to a .pt checkpoint saved by train.py.
+        checkpoint_path: Path to base training checkpoint (train.py best.pt).
+        adapter_path:    Optional path to PINN LoRA adapter checkpoint.
+        lora_rank:       Rank used when the adapter was trained (default 32).
         out_dir:         Directory for exported files.
         formats:         List of formats: ["torchscript", "onnx"].
                          Defaults to both.
@@ -208,19 +218,41 @@ def load_and_export(
         formats = ["torchscript", "onnx"]
 
     out_dir = Path(out_dir)
-    model   = BatesSurrogate.from_checkpoint(checkpoint_path)
-    print(f"[export] loaded checkpoint: {checkpoint_path}")
-    print(f"[export] model: {model.n_parameters():,} parameters")
+
+    if adapter_path is not None:
+        combined = BatesSurrogateWithPINN.from_checkpoints(
+            checkpoint_path, adapter_path, rank=lora_rank
+        )
+        combined.eval()
+        # Wrap so export functions see .n_params attribute
+        model = combined
+        n_params = combined.base.n_params
+        print(f"[export] loaded base checkpoint: {checkpoint_path}")
+        print(f"[export] loaded PINN adapter:    {adapter_path}  (rank={lora_rank})")
+        print(f"[export] combined model: {combined.base.n_parameters():,} base + "
+              f"{combined.adapter.n_parameters():,} adapter parameters")
+    else:
+        model = BatesSurrogate.from_checkpoint(checkpoint_path)
+        n_params = model.n_params
+        print(f"[export] loaded checkpoint: {checkpoint_path}")
+        print(f"[export] model: {model.n_parameters():,} parameters")
 
     results: dict[str, str] = {}
 
     if "torchscript" in formats:
         pt_path = out_dir / "bates_surrogate.pt"
-        results["torchscript"] = export_torchscript(model, pt_path)
+        # export_torchscript uses model.n_params; patch if needed
+        _orig = getattr(model, "n_params", None)
+        if _orig is None:
+            model.n_params = n_params  # type: ignore[attr-defined]
+        results["torchscript"] = export_torchscript(model, pt_path)  # type: ignore[arg-type]
 
     if "onnx" in formats:
         onnx_path = out_dir / "bates_surrogate.onnx"
-        results["onnx"] = export_onnx(model, onnx_path)
+        _orig = getattr(model, "n_params", None)
+        if _orig is None:
+            model.n_params = n_params  # type: ignore[attr-defined]
+        results["onnx"] = export_onnx(model, onnx_path)  # type: ignore[arg-type]
 
     return results
 
@@ -236,6 +268,11 @@ if __name__ == "__main__":
     )
     ap.add_argument("--checkpoint", type=str, required=True,
                     help="Training checkpoint path (e.g. model/runs/best.pt)")
+    ap.add_argument("--adapter",    type=str, default=None,
+                    help="PINN LoRA adapter checkpoint (e.g. model/runs/best_pinn_adapter.pt). "
+                         "When provided, exports base+adapter fused as a single model.")
+    ap.add_argument("--lora-rank",  type=int, default=32,
+                    help="LoRA rank used during PINN fine-tuning (default 32)")
     ap.add_argument("--out-dir",    type=str, default="model/",
                     help="Output directory for exported files")
     ap.add_argument("--format",     type=str, default="both",
@@ -248,6 +285,8 @@ if __name__ == "__main__":
     fmts = ["torchscript", "onnx"] if args.format == "both" else [args.format]
     paths = load_and_export(
         checkpoint_path = args.checkpoint,
+        adapter_path    = args.adapter,
+        lora_rank       = args.lora_rank,
         out_dir         = args.out_dir,
         formats         = fmts,
     )

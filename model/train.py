@@ -53,7 +53,7 @@ from torch.utils.data import DataLoader
 # Allow running as  python -m model.train  from the project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from model.network import BatesSurrogate, GridConstants
+from model.network import BatesSurrogate, BatesSurrogateWithPINN, PINNAdapter, GridConstants
 from model.loss import (
     LossBreakdown,
     compute_vega_weights,
@@ -209,7 +209,7 @@ def build_dataloaders(
     train_preload = preload in {"train", "all"}
     val_preload = preload == "all"
 
-    meta_ds = BatesDataset(h5_path, min_valid_cells=0, preload=False)
+    meta_ds = BatesDataset(h5_path, min_valid_cells=None, preload=False)
     N       = len(meta_ds)
 
     def _build_with_fallback(base_kwargs: dict, split_name: str, preload_now: bool, preload_device_now: str):
@@ -540,6 +540,105 @@ def _save_checkpoint(
 
 
 # ---------------------------------------------------------------------------
+# PINN LoRA fine-tune entry point
+# ---------------------------------------------------------------------------
+
+def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
+    """
+    Fine-tune a frozen BatesSurrogate with a PINNAdapter.
+
+    The base model is loaded from args.pinn_finetune and frozen.  Only the
+    small adapter (rank=args.lora_rank) is updated using PINN losses
+    (calendar + butterfly) plus a small vega anchor (args.lora_vega_weight)
+    to prevent the correction from drifting away from valid IV values.
+    """
+    from model.loss import calendar_spread_penalty, durrleman_butterfly_penalty
+
+    combined = BatesSurrogateWithPINN.from_checkpoints(
+        args.pinn_finetune, rank=args.lora_rank
+    ).to(device)
+    combined.freeze_base()
+
+    n_adapter = combined.adapter.n_parameters()
+    print(f"[pinn-finetune] base frozen  adapter params={n_adapter:,}  rank={args.lora_rank}")
+    print(f"[pinn-finetune] λ_cal={args.lambda_cal}  λ_bfly={args.lambda_bfly}  "
+          f"λ_vega_anchor={args.lora_vega_weight}")
+
+    optimizer = torch.optim.Adam(combined.adapter.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=10, min_lr=1e-6,
+    )
+    scaler = amp.GradScaler("cuda")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    best_val_cal = float("inf")
+
+    for epoch in range(args.epochs):
+        combined.train()
+        t0 = time.time()
+        for batch in train_loader:
+            params_norm = batch[0].to(device, non_blocking=True)
+            iv_flat     = batch[1].to(device, non_blocking=True)
+            mask_flat   = batch[2].to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            with amp.autocast("cuda", dtype=torch.bfloat16):
+                iv_pred = combined(params_norm)
+                l_cal  = calendar_spread_penalty(iv_pred, grid, mask_flat)
+                l_bfly = durrleman_butterfly_penalty(iv_pred, grid, mask_flat)
+                # Anchor: small vega loss prevents the adapter from drifting
+                l_vega = ((iv_pred.float() - iv_flat.float()) ** 2 * mask_flat.float()).sum(dim=1)
+                l_vega = l_vega / mask_flat.float().sum(dim=1).clamp(min=1.0)
+                l_vega = l_vega.mean()
+                loss = args.lambda_cal * l_cal + args.lambda_bfly * l_bfly + args.lora_vega_weight * l_vega
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(combined.adapter.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+
+        # Validation
+        combined.eval()
+        val_cal_sum = val_bfly_sum = val_n = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                params_norm = batch[0].to(device, non_blocking=True)
+                iv_flat     = batch[1].to(device, non_blocking=True)
+                mask_flat   = batch[2].to(device, non_blocking=True)
+                iv_pred = combined(params_norm)
+                val_cal_sum  += calendar_spread_penalty(iv_pred, grid, mask_flat).item()
+                val_bfly_sum += durrleman_butterfly_penalty(iv_pred, grid, mask_flat).item()
+                val_n += 1
+
+        val_cal  = val_cal_sum  / max(val_n, 1)
+        val_bfly = val_bfly_sum / max(val_n, 1)
+        val_monitor = args.lambda_cal * val_cal + args.lambda_bfly * val_bfly
+        scheduler.step(val_monitor)
+
+        lr_now = optimizer.param_groups[0]["lr"]
+        print(
+            f"epoch {epoch:4d}  lr={lr_now:.2e}  "
+            f"val_cal={val_cal:.6f}  val_bfly={val_bfly:.6f}  [{time.time()-t0:.1f}s]"
+        )
+
+        if val_monitor < best_val_cal:
+            best_val_cal = val_monitor
+            torch.save(
+                {"adapter_state_dict": combined.adapter.state_dict(),
+                 "base_checkpoint": args.pinn_finetune,
+                 "lora_rank": args.lora_rank,
+                 "epoch": epoch},
+                out_dir / "best_pinn_adapter.pt",
+            )
+            print(f"  [checkpoint] pinn_adapter  val_pinn={best_val_cal:.6f}")
+
+    print(f"\n[done] PINN fine-tune complete.  best val_pinn={best_val_cal:.6f}")
+    print(f"[done] adapter checkpoint → {out_dir / 'best_pinn_adapter.pt'}")
+
+
+# ---------------------------------------------------------------------------
 # Main training entry point
 # ---------------------------------------------------------------------------
 
@@ -589,6 +688,13 @@ def main() -> None:
                     help="Enable dual-head training with parameter predictions for identifiability")
     ap.add_argument("--lambda-param", type=float, default=0.1,
                     help="Weight for parameter MSE term in dual-head loss (default 0.1)")
+    ap.add_argument("--pinn-finetune", type=str, default=None, metavar="CKPT",
+                    help="PINN LoRA fine-tune mode: freeze base model from CKPT and train "
+                         "a PINNAdapter with calendar + butterfly constraints only.")
+    ap.add_argument("--lora-rank",    type=int, default=32,
+                    help="Bottleneck rank for PINNAdapter (default 32)")
+    ap.add_argument("--lora-vega-weight", type=float, default=0.05,
+                    help="Weight of vega loss during PINN fine-tune to prevent IV drift (default 0.05)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -629,9 +735,16 @@ def main() -> None:
         return_confidence = args.confidence,
     )
 
+    # -----------------------------------------------------------------------
+    # PINN LoRA fine-tune mode
+    # -----------------------------------------------------------------------
+    if args.pinn_finetune:
+        _run_pinn_finetune(args, device, grid, train_loader, val_loader)
+        return
+
     # Model
     model_config = dict(
-        n_params  = 5,   # 5 Heston params (kappa, theta, sigma, rho, v0)
+        n_params  = 6,   # 5 Heston params + carry (r-q)
         n_outputs = grid.N_FLAT,
         width     = args.width,
         n_blocks  = args.n_blocks,

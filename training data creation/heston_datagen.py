@@ -113,17 +113,11 @@ def load_guided_param_bank(path: str) -> np.ndarray:
 #  Historical SPX Heston calibrations (normal regimes) cluster well within these.
 
 PARAM_BOUNDS: np.ndarray = np.array([
-    [0.30, 8.00],    # κ    mean-reversion speed  (very low κ + high θ is degenerate)
-    [0.02, 0.12],    # θ    long-run variance  (σ_LR ∈ [14%, 35%])
-    [0.05, 1.20],    # σ_v  vol-of-vol
-    [-0.98, 0.10],   # ρ    equity skew almost always negative
-    [0.02, 0.12],    # v₀   initial variance  (σ₀  ∈ [14%, 35%])
-    # TODO(deep-cal): retrain with more realistic equity-market bounds once the
-    # current surrogate is validated end-to-end.  Recommended target:
-    #   κ ∈ [0.5, 8.0], θ ∈ [0.01, 0.10], σ_v ∈ [0.10, 1.00],
-    #   ρ ∈ [-0.95, 0.0], v₀ ∈ [0.01, 0.10]
-    # These tighter bounds reduce training variance and align the surrogate
-    # with typical SPX/SPY calibrations outside crisis regimes.
+    [0.50, 6.00],    # κ    mean-reversion speed
+    [0.02, 0.10],    # θ    long-run variance  (σ_LR ∈ [14%, 32%])
+    [0.10, 0.90],    # σ_v  vol-of-vol
+    [-0.95, -0.20],  # ρ    equity skew — always negative in practice
+    [0.02, 0.10],    # v₀   initial variance  (σ₀  ∈ [14%, 32%])
 ], dtype=np.float64)
 PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0"]
 N_PARAMS: int = len(PARAM_NAMES)  # 5
@@ -232,17 +226,7 @@ def sample_params(
     raw     = sampler.random(n_raw)
     pts_base = qmc.scale(raw, lo, hi)[:n_base]   # float64
 
-    # Mixture prior: dedicate a small fraction to stressed skew regimes.
-    # Only σ_v and ρ are stressed — these create realistic short-tenor skew
-    # without inflating the average IV level. Jump boosting is removed since
-    # this is now a pure Heston surrogate.
     rng = np.random.default_rng(seed + 2026)
-    stress_prob = 0.12
-    stress = rng.random(n_base) < stress_prob
-    n_stress = int(stress.sum())
-    if n_stress > 0:
-        pts_base[stress, 2] = rng.uniform(0.40, 1.20, size=n_stress)    # sigma_v: stressed but realistic
-        pts_base[stress, 3] = rng.uniform(-0.98, -0.60, size=n_stress)   # rho: steep skew
 
     if n_guided > 0:
         pick = rng.integers(0, len(guided_bank), size=n_guided) # type: ignore
@@ -260,7 +244,6 @@ def sample_params(
     print(
         f"[sample] Sobol draws: {n_raw:,}  |  "
         f"Feller pass: {feller_pct:.1f}% (not filtered)  |  "
-        f"stress regime: {100.0 * n_stress / max(1, n_base):.1f}% (base)  |  "
         f"guided mix: {100.0 * n_guided / max(1, N):.1f}%  |  keeping: {N:,}"
     )
     return pts   # (N, 8) float64
@@ -272,8 +255,8 @@ def bates_cf(
     u:      torch.Tensor,   # (Nc,)  real frequencies, float64
     T:      float,
     params: torch.Tensor,   # (B, 5) float64  [κ, θ, σ_v, ρ, v₀]  — pure Heston
-    r:      float,
-    q:      float,
+    r:      torch.Tensor,   # (B,)   float64  risk-free rate per sample
+    q:      torch.Tensor,   # (B,)   float64  dividend yield per sample
 ) -> torch.Tensor:           # (B, Nc) complex128
     """
     φ(u) = E_Q[e^{iu·ln(S_T/S_0)}] under Heston (1993) model.
@@ -290,7 +273,8 @@ def bates_cf(
     ρ  = params[:, 3:4]
     v0 = params[:, 4:5]
 
-    uc   = u.to(dtype=torch.complex128)          # (Nc,)
+    uc    = u.to(dtype=torch.complex128)          # (Nc,)
+    carry = (r - q).to(dtype=torch.complex128).unsqueeze(1)  # (B, 1)
 
     ξ    = κ - 1j * ρ * σv * uc                 # (B, Nc)
     d    = torch.sqrt(ξ**2 + σv**2 * uc * (uc + 1j))
@@ -298,7 +282,7 @@ def bates_cf(
     e_dT = torch.exp(-d * T)
     logQ = torch.log((1.0 - g * e_dT) / (1.0 - g))
 
-    A = 1j * uc * (r - q) * T
+    A = 1j * carry * uc[None, :] * T             # (B, Nc)
     B = (κ * θ / σv**2) * ((ξ - d) * T - 2.0 * logQ)
     C = (v0  / σv**2)   * (ξ - d) * (1.0 - e_dT) / (1.0 - g * e_dT)
 
@@ -344,8 +328,8 @@ def cos_call_prices(
     T:       float,
     S0:      float,
     K_grid:  torch.Tensor,   # (NK,)  float64
-    r:       float,
-    q:       float,
+    r:       torch.Tensor,   # (B,)   float64  risk-free rate per sample
+    q:       torch.Tensor,   # (B,)   float64  dividend yield per sample
     k_idx:   torch.Tensor,   # (Nc,)  int
 ) -> torch.Tensor:            # (B, NK) float64
     """
@@ -369,7 +353,7 @@ def cos_call_prices(
     W_sin = (torch.sin(phase_mat) * Vk[None, :]).T  # (Nc, NK)
 
     price_sum = c_base.real @ W_cos - c_base.imag @ W_sin   # (B, NK) float64
-    prices    = math.exp(-r * T) * K_grid[None, :] * price_sum
+    prices    = torch.exp(-r * T).unsqueeze(1) * K_grid[None, :] * price_sum  # (B, NK)
     return prices.clamp(min=0.0)
 
 
@@ -380,13 +364,13 @@ def call_to_otm(
     K_grid:      torch.Tensor,   # (NK,)   float64
     T:           float,
     S0:          float,
-    r:           float,
-    q:           float,
+    r:           torch.Tensor,   # (B,)   float64  risk-free rate per sample
+    q:           torch.Tensor,   # (B,)   float64  dividend yield per sample
     is_put:      torch.Tensor,   # (NK,)   bool
 ) -> torch.Tensor:                # (B, NK) float64
-    disc  = math.exp(-r * T)
-    fwd_d = S0 * math.exp(-q * T)
-    put   = (call_prices + (K_grid * disc - fwd_d)[None, :]).clamp(min=0.0)
+    disc  = torch.exp(-r * T).unsqueeze(1)          # (B, 1)
+    fwd_d = S0 * torch.exp(-q * T).unsqueeze(1)    # (B, 1)
+    put   = (call_prices + K_grid[None, :] * disc - fwd_d).clamp(min=0.0)
     return torch.where(is_put[None, :], put, call_prices)
 
 
@@ -402,18 +386,19 @@ def _ncdf(x: torch.Tensor) -> torch.Tensor:
 
 def _bs_price_vega(
     sigma:  torch.Tensor,   # (B, NK) float64
-    F:      float,
+    F:      torch.Tensor,   # (B,)    float64  forward price per sample
     K:      torch.Tensor,   # (NK,)   float64
     T:      float,
-    r:      float,
+    r:      torch.Tensor,   # (B,)    float64  risk-free rate per sample
     is_put: torch.Tensor,   # (NK,)   bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    sqT  = math.sqrt(T); disc = math.exp(-r * T)
-    F_t  = torch.full_like(sigma, F)
-    d1   = (torch.log(F_t / K) + 0.5 * sigma**2 * T) / (sigma * sqT + 1e-30)
+    sqT  = math.sqrt(T)
+    disc = torch.exp(-r * T).unsqueeze(1)           # (B, 1)
+    F_t  = F.unsqueeze(1).expand_as(sigma)          # (B, NK)
+    d1   = (torch.log(F_t / K[None, :]) + 0.5 * sigma**2 * T) / (sigma * sqT + 1e-30)
     d2   = d1 - sigma * sqT
-    call = disc * (F_t * _ncdf(d1) - K * _ncdf(d2))
-    put  = call + (K * disc - F_t * disc)
+    call = disc * (F_t * _ncdf(d1) - K[None, :] * _ncdf(d2))
+    put  = call + (K[None, :] * disc - F_t * disc)
     vega = disc * F_t * sqT * torch.exp(-0.5 * d1**2) * _INV_SQRT2PI
     return torch.where(is_put[None, :], put, call), vega
 
@@ -425,8 +410,8 @@ def prices_to_iv(
     K_grid: torch.Tensor,   # (NK,)   float64
     T:      float,
     S0:     float,
-    r:      float,
-    q:      float,
+    r:      torch.Tensor,   # (B,)   float64  risk-free rate per sample
+    q:      torch.Tensor,   # (B,)   float64  dividend yield per sample
     is_put: torch.Tensor,   # (NK,)   bool
 ) -> torch.Tensor:           # (B, NK) float64, NaN where non-invertible
     """
@@ -434,16 +419,16 @@ def prices_to_iv(
     20 iterations: converges to machine precision (~1e-14) in 6-8 steps.
     NaN flagged when price <= intrinsic + 1e-12 or residual > 1e-6.
     """
-    F    = S0 * math.exp((r - q) * T)
-    disc = math.exp(-r * T)
+    F    = S0 * torch.exp((r - q) * T)             # (B,)  forward per sample
+    disc = torch.exp(-r * T)                        # (B,)
 
-    call_int  = (F - K_grid * disc).clamp(min=0.0)
-    put_int   = (K_grid * disc - F).clamp(min=0.0)
-    intrinsic = torch.where(is_put, put_int, call_int)
+    call_int  = (F[:, None] - K_grid[None, :] * disc[:, None]).clamp(min=0.0)   # (B, NK)
+    put_int   = (K_grid[None, :] * disc[:, None] - F[:, None]).clamp(min=0.0)   # (B, NK)
+    intrinsic = torch.where(is_put[None, :], put_int, call_int)
 
-    zero_mask = otm <= intrinsic[None, :] + 1e-12
+    zero_mask = otm <= intrinsic + 1e-12
 
-    sigma = (otm / F) * math.sqrt(2.0 * math.pi / T)
+    sigma = (otm / F[:, None]) * math.sqrt(2.0 * math.pi / T)
     sigma = sigma.clamp(IV_LO, IV_HI)
 
     for _ in range(N_NEWTON):
@@ -484,7 +469,10 @@ def sanity_check(dev: torch.device) -> None:
         return max(math.exp(-r*T)*K*s, max(S0*math.exp((r-q)*T)-K*math.exp(-r*T),0.))
 
     kappa, theta, sv, rho, v0 = 2.0, 0.04, 0.30, -0.70, 0.04
-    S0, r, q = 1.0, 0.0, 0.0
+    S0 = 1.0
+    r_np, q_np = 0.0, 0.0   # scalar floats for numpy reference
+    r_t = torch.tensor([r_np], device=dev, dtype=torch.float64)  # (1,) for pricer
+    q_t = torch.tensor([q_np], device=dev, dtype=torch.float64)
     K_t    = torch.tensor([S0], device=dev, dtype=torch.float64)
     k_idx  = torch.arange(N_COS, device=dev)
     Vk     = cos_call_Vk(dev)
@@ -496,11 +484,11 @@ def sanity_check(dev: torch.device) -> None:
 
     all_ok = True
     for T in test_maturities:
-        ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r, q)
-        gpu  = cos_call_prices(par, Vk, float(T), S0, K_t, r, q, k_idx)[0, 0].item()
+        ref  = cos_f64_np(S0, S0, float(T), kappa, theta, sv, rho, v0, r_np, q_np)
+        gpu  = cos_call_prices(par, Vk, float(T), S0, K_t, r_t, q_t, k_idx)[0, 0].item()
         pe   = abs(gpu - ref) / (ref + 1e-15) * 100
         otm  = torch.tensor([[gpu]], device=dev, dtype=torch.float64)
-        iv   = prices_to_iv(otm, K_t, float(T), S0, r, q, is_put)[0, 0].item()
+        iv   = prices_to_iv(otm, K_t, float(T), S0, r_t, q_t, is_put)[0, 0].item()
         ok   = pe < 0.001 and not math.isnan(iv)
         all_ok &= ok
         print(
@@ -533,16 +521,9 @@ def generate(
     guided_bank_path: str | None = None,
     guided_weight: float = 0.0,
     guided_jitter: float = 0.04,
-    n_rq_chunks:   int | None = None,
     no_carry:      bool = False,
 ) -> None:
     """
-    n_rq_chunks: number of distinct (r, q) regimes used across all chunks.
-    Each chunk is assigned one (r, q) pair; pairs are drawn from a Sobol
-    sequence so they cover [R_BOUNDS × Q_BOUNDS] quasi-uniformly.
-    Default: max(1000, n_chunks) — many more than the number of chunks so
-    every chunk gets a unique (r, q).
-
     no_carry: when True, fix r=0 and q=0 for all samples.  This is consistent
     with the Rust inference code (which always uses r=q=0 when n_params=5) and
     makes the 5-param → IV surface mapping a deterministic function, which is
@@ -580,22 +561,19 @@ def generate(
     n_chunks = math.ceil(N / chunk_size)
 
     if no_carry:
-        chunk_rq = None
+        sample_rq = None
         print("[rq-diversity]  no-carry mode: r=0, q=0 for all samples")
     else:
-        # Pre-generate a Sobol sequence of (r, q) pairs for well-distributed market
-        # environment coverage.  Each chunk is assigned one pair, so every forward
-        # pass uses a distinct (r, q) regime.
-        n_rq = max(n_rq_chunks if n_rq_chunks is not None else 0, max(1000, n_chunks))
+        # Pre-generate one independent (r, q) per sample via Sobol for
+        # quasi-uniform coverage of [R_BOUNDS × Q_BOUNDS].  Every sample
+        # sees its own carry value; the network cannot cheat by memorising
+        # a small number of shared carry points.
         rq_sampler = qmc.Sobol(d=2, scramble=True, seed=seed + 3141)
-        n_rq_raw   = int(2 ** math.ceil(math.log2(max(2, n_rq))))
-        rq_raw     = rq_sampler.random(n_rq_raw)[:n_rq]
-        rq_scaled  = qmc.scale(rq_raw, [R_BOUNDS[0], Q_BOUNDS[0]], [R_BOUNDS[1], Q_BOUNDS[1]])
-        rng        = np.random.default_rng(seed + 7777)
-        rq_order   = rng.permutation(n_rq)
-        chunk_rq   = rq_scaled[rq_order % n_rq]
+        n_rq_raw   = int(2 ** math.ceil(math.log2(max(2, int(N * 1.5)))))
+        rq_raw     = rq_sampler.random(n_rq_raw)[:N]
+        sample_rq  = qmc.scale(rq_raw, [R_BOUNDS[0], Q_BOUNDS[0]], [R_BOUNDS[1], Q_BOUNDS[1]])
         print(
-            f"[rq-diversity]  n_chunks={n_chunks}  n_rq_distinct={n_rq}  "
+            f"[rq-diversity]  per-sample (r,q): N={N:,}  "
             f"r∈[{R_BOUNDS[0]:.2f},{R_BOUNDS[1]:.2f}]  "
             f"q∈[{Q_BOUNDS[0]:.2f},{Q_BOUNDS[1]:.2f}]"
         )
@@ -660,20 +638,21 @@ def generate(
             i1 = min(i0 + chunk_size, N)
             B  = i1 - i0
 
-            if no_carry or chunk_rq is None:
-                r, q = 0.0, 0.0
+            if no_carry or sample_rq is None:
+                r_t = torch.zeros(B, device=dev, dtype=torch.float64)
+                q_t = torch.zeros(B, device=dev, dtype=torch.float64)
             else:
-                r = float(chunk_rq[ci % len(chunk_rq), 0])
-                q = float(chunk_rq[ci % len(chunk_rq), 1])
+                r_t = torch.tensor(sample_rq[i0:i1, 0], device=dev, dtype=torch.float64)
+                q_t = torch.tensor(sample_rq[i0:i1, 1], device=dev, dtype=torch.float64)
 
             params_t = torch.tensor(params_np[i0:i1], device=dev, dtype=torch.float64)
             iv_chunk = torch.full((B, NK, NT), float("nan"),
                                   dtype=torch.float64, device=dev)
 
             for ti, T in enumerate(MATURITIES.tolist()):
-                call_p = cos_call_prices(params_t, Vk, T, S0, K_grid, r, q, k_idx) # type: ignore
-                otm_p  = call_to_otm(call_p, K_grid, T, S0, r, q, is_put) # type: ignore
-                iv_chunk[:, :, ti] = prices_to_iv(otm_p, K_grid, T, S0, r, q, is_put) # type: ignore
+                call_p = cos_call_prices(params_t, Vk, T, S0, K_grid, r_t, q_t, k_idx)
+                otm_p  = call_to_otm(call_p, K_grid, T, S0, r_t, q_t, is_put)
+                iv_chunk[:, :, ti] = prices_to_iv(otm_p, K_grid, T, S0, r_t, q_t, is_put)
 
             raw_mask_chunk = ~torch.isnan(iv_chunk)       # (B, NK, NT) bool
 
@@ -693,8 +672,8 @@ def generate(
 
             total_valid_cells += int(mask_chunk.sum().item())
 
-            # Store r, q per sample (same value within chunk)
-            rq_chunk = np.full((B, 2), [r, q], dtype=np.float64)
+            # Store r, q per sample (independent draws)
+            rq_chunk = np.stack([r_t.cpu().numpy(), q_t.cpu().numpy()], axis=1)  # (B, 2)
 
             ds_p[i0:i1]  = params_np[i0:i1] # type: ignore
             ds_mp[i0:i1] = rq_chunk # type: ignore
@@ -995,9 +974,6 @@ if __name__ == "__main__":
                     help="Fraction of samples drawn from guided param bank")
     ap.add_argument("--guided-jitter", type=float, default=0.04,
                     help="Relative jitter scale applied to guided params")
-    ap.add_argument("--rq-chunks", type=int, default=None,
-                    help="Number of distinct (r,q) regimes to use (default: max(1000, n_chunks)). "
-                         "Pre-generated via Sobol for quasi-uniform coverage of market environments.")
     ap.add_argument("--no-carry", action="store_true",
                     help="Fix r=0, q=0 for all samples (consistent with Rust inference; "
                          "makes the 5-param→IV mapping deterministic).")
@@ -1023,7 +999,6 @@ if __name__ == "__main__":
                  guided_bank_path=args.guided_bank,
                  guided_weight=args.guided_weight,
                  guided_jitter=args.guided_jitter,
-                 n_rq_chunks=args.rq_chunks,
                  no_carry=args.no_carry)
     else:
         generate(N=args.N, output_path=args.out, seed=args.seed,
@@ -1031,5 +1006,4 @@ if __name__ == "__main__":
                  guided_bank_path=args.guided_bank,
                  guided_weight=args.guided_weight,
                  guided_jitter=args.guided_jitter,
-                 n_rq_chunks=args.rq_chunks,
                  no_carry=args.no_carry)

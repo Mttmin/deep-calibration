@@ -145,6 +145,23 @@ def vega_weighted_mse(
     return loss.mean()
 
 
+def masked_mse(
+    iv_pred:    torch.Tensor,
+    iv_target:  torch.Tensor,
+    mask:       torch.Tensor,
+    confidence: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Masked MSE on IVs with optional confidence weights."""
+    pred = iv_pred.float()
+    target = iv_target.float()
+    m = mask.float()
+    conf = confidence.float() if confidence is not None else torch.ones_like(m)
+    w = m * conf
+    sq_err = (pred - target) ** 2
+    loss = (w * sq_err).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+    return loss.mean()
+
+
 # ---------------------------------------------------------------------------
 # PINN penalty 1: calendar-spread no-arbitrage
 # ---------------------------------------------------------------------------
@@ -289,6 +306,7 @@ def total_loss(
     lambda_cal:  float = 0.1,
     lambda_bfly: float = 0.05,
     confidence:  torch.Tensor | None = None,  # (B, N_FLAT) float32 ∈ [0,1]  optional
+    data_loss:   str = "vega",
 ) -> LossBreakdown:
     """
     Combined training loss:
@@ -312,7 +330,12 @@ def total_loss(
         LossBreakdown(total, vega, calendar, butterfly).
         All fields are scalar tensors; call .item() for logging.
     """
-    l_vega  = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
+    if data_loss == "vega":
+        l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
+    elif data_loss == "ivrmse":
+        l_vega = masked_mse(iv_pred, iv_target, mask, confidence=confidence)
+    else:
+        raise ValueError(f"Unknown data_loss: {data_loss}")
     l_cal   = calendar_spread_penalty(iv_pred, grid, mask)
     l_bfly  = durrleman_butterfly_penalty(iv_pred, grid, mask)
 
@@ -342,6 +365,7 @@ def dual_head_loss(
     lambda_cal:    float = 0.1,
     lambda_bfly:   float = 0.05,
     confidence:    torch.Tensor | None = None,
+    data_loss:     str = "vega",
 ) -> LossBreakdown:
     """
     Combined dual-head training loss:
@@ -373,8 +397,13 @@ def dual_head_loss(
         LossBreakdown(total, vega, calendar, butterfly).
         Note: The 'vega' field includes IV MSE; parameter MSE is implicit in total.
     """
-    # IV loss (as before)
-    l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
+    # IV data loss (vega-weighted MSE or plain masked MSE)
+    if data_loss == "vega":
+        l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
+    elif data_loss == "ivrmse":
+        l_vega = masked_mse(iv_pred, iv_target, mask, confidence=confidence)
+    else:
+        raise ValueError(f"Unknown data_loss: {data_loss}")
 
     # Parameter MSE loss (L2 distance between predicted and true Heston params)
     param_pred_f = param_pred.float()

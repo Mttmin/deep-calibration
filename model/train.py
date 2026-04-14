@@ -49,7 +49,7 @@ import h5py
 import numpy as np
 import torch
 import torch.amp as amp
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 # Allow running as  python -m model.train  from the project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -65,7 +65,7 @@ from model.loss import (
 
 # BatesDataset lives in the data-generation script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training data creation"))
-from heston_datagen import BatesDataset   # type: ignore[import]
+from heston_datagen import BatesDataset, CARRY_LO, CARRY_HI   # type: ignore[import]
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +206,8 @@ def build_dataloaders(
     """
     Builds train / val DataLoaders from a BatesDataset HDF5 file.
 
-    Split strategy: last ``val_frac`` fraction of dataset indices as val.
-    Sobol sequences are space-filling, so the last 10% covers parameter
-    space as well as any random subset.
+    Split strategy: seeded random permutation of dataset indices, then
+    first ``val_frac`` fraction as validation and the rest as training.
 
     If ``val_h5`` is provided, it is used as a separate validation dataset
     (ignores ``val_frac``).
@@ -233,10 +232,11 @@ def build_dataloaders(
 
     def _sample_indices(indices: np.ndarray) -> np.ndarray:
         if sample_frac >= 1.0:
-            return indices
+            # h5py fancy indexing requires strictly increasing positions.
+            return np.sort(indices)
         n_keep = max(1, int(math.floor(len(indices) * sample_frac)))
         choice = rng.choice(len(indices), size=n_keep, replace=False)
-        return indices[np.sort(choice)]
+        return np.sort(indices[np.sort(choice)])
 
     def _build_with_fallback(base_kwargs: dict, split_name: str, preload_now: bool, preload_device_now: str):
         kwargs = dict(base_kwargs)
@@ -277,23 +277,41 @@ def build_dataloaders(
             "return_confidence": False,
         }, "val", val_preload, val_preload_device)
     else:
-        n_val   = max(1, int(math.ceil(N * val_frac)))
-        n_train = N - n_val
-        train_positions = _sample_indices(np.arange(0, n_train, dtype=np.int64))
-        val_positions = _sample_indices(np.arange(n_train, N, dtype=np.int64))
+        rng_split = np.random.default_rng(seed)
+        all_positions = np.arange(N, dtype=np.int64)
+        rng_split.shuffle(all_positions)
+        n_val = max(1, int(math.ceil(N * val_frac)))
+        val_positions = _sample_indices(all_positions[:n_val])
+        train_positions = _sample_indices(all_positions[n_val:])
 
-        train_ds, train_preload, train_preload_device = _build_with_fallback({
-            "h5_path": h5_path,
-            "min_valid_cells": 0,
-            "indices": train_positions,
-            "return_confidence": return_confidence,
-        }, "train", train_preload, train_preload_device)
-        val_ds, val_preload, val_preload_device = _build_with_fallback({
-            "h5_path": h5_path,
-            "min_valid_cells": 0,
-            "indices": val_positions,
-            "return_confidence": False,
-        }, "val", val_preload, val_preload_device)
+        # Keep random split membership while preserving fast contiguous preload:
+        # when preloading all samples at full fraction, preload once and split via Subset.
+        if preload == "all" and sample_frac >= 1.0:
+            full_ds, full_preload, full_preload_device = _build_with_fallback({
+                "h5_path": h5_path,
+                "min_valid_cells": 0,
+                "indices": None,
+                "return_confidence": return_confidence,
+            }, "full", True, train_preload_device)
+            train_ds = Subset(full_ds, train_positions.tolist())
+            val_ds = Subset(full_ds, val_positions.tolist())
+            train_preload = full_preload
+            val_preload = full_preload
+            train_preload_device = full_preload_device
+            val_preload_device = full_preload_device
+        else:
+            train_ds, train_preload, train_preload_device = _build_with_fallback({
+                "h5_path": h5_path,
+                "min_valid_cells": 0,
+                "indices": train_positions,
+                "return_confidence": return_confidence,
+            }, "train", train_preload, train_preload_device)
+            val_ds, val_preload, val_preload_device = _build_with_fallback({
+                "h5_path": h5_path,
+                "min_valid_cells": 0,
+                "indices": val_positions,
+                "return_confidence": False,
+            }, "val", val_preload, val_preload_device)
 
     # If preloading to CUDA, we must force single-process loading because
     # CUDA tensors cannot be easily shared across worker processes. If
@@ -383,10 +401,13 @@ def train_one_epoch(
     time_batches: bool = False,
     use_dual_head: bool = False,
     lambda_param: float = 0.1,
+    data_loss: str = "vega",
 ) -> dict[str, float]:
     model.train()
 
     sums  = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0)
+    sq_err_sum = 0.0
+    valid_sum = 0.0
     steps = 0
     batch_wait_s = 0.0
     h2d_s = 0.0
@@ -413,16 +434,12 @@ def train_one_epoch(
         h2d_t1 = time.perf_counter()
         h2d_s += h2d_t1 - h2d_t0
 
-        # Denormalise r and q for vega weight computation
-        # Note: r and q are market observables (not calibration parameters)
-        # They flow through the network but are NOT predicted by the parameter head
+        # Denormalise carry (r-q) for vega weight computation.
+        # Slot 5 is carry_norm = (r-q - CARRY_LO) / (CARRY_HI - CARRY_LO).
         compute_t0 = time.perf_counter()
-        if params_norm.shape[1] > 6:
-            r = params_norm[:, 5] * 0.06   # r at index 5 (5 Heston params then r, q)
-            q = params_norm[:, 6] * 0.04   # q at index 6
-        else:
-            r = torch.zeros(params_norm.shape[0], device=params_norm.device)
-            q = torch.zeros(params_norm.shape[0], device=params_norm.device)
+        carry_phys = params_norm[:, 5] * (CARRY_HI - CARRY_LO) + CARRY_LO
+        r = carry_phys.clamp(min=0.0)
+        q = (-carry_phys).clamp(min=0.0)
 
         # Vega weights: computed in float32 on the ground-truth IV
         vega_w = compute_vega_weights(iv_flat, grid, r, q)
@@ -445,12 +462,14 @@ def train_one_epoch(
                 lambda_param=lambda_param,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
                 confidence=conf_flat,
+                data_loss=data_loss,
             )
         else:
             bd = total_loss(
                 iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
                 confidence=conf_flat,
+                data_loss=data_loss,
             )
 
         scaler.scale(bd.total).backward()
@@ -468,9 +487,14 @@ def train_one_epoch(
         sums["vega"]      += bd.vega.item()
         sums["calendar"]  += bd.calendar.item()
         sums["butterfly"] += bd.butterfly.item()
+        m = mask_flat.float()
+        sq_err_sum += ((iv_pred.float() - iv_flat) ** 2 * m).sum().item()
+        valid_sum += m.sum().item()
         steps += 1
 
     metrics = {k: v / max(steps, 1) for k, v in sums.items()}
+    mse = sq_err_sum / max(valid_sum, 1.0)
+    metrics["ivrmse_bps"] = math.sqrt(mse) * 10_000.0
     metrics["batch_wait_ms"] = 1e3 * batch_wait_s / max(steps, 1)
     metrics["h2d_ms"] = 1e3 * h2d_s / max(steps, 1)
     metrics["compute_ms"] = 1e3 * compute_s / max(steps, 1)
@@ -491,6 +515,7 @@ def validate(
     device:      torch.device,
     use_dual_head: bool = False,
     lambda_param: float = 0.1,
+    data_loss: str = "vega",
 ) -> dict[str, float]:
     model.eval()
 
@@ -504,12 +529,9 @@ def validate(
         iv_flat     = batch[1].to(device, non_blocking=True)
         mask_flat   = batch[2].to(device, non_blocking=True)
 
-        if params_norm.shape[1] > 6:
-            r = params_norm[:, 5] * 0.06
-            q = params_norm[:, 6] * 0.04
-        else:
-            r = torch.zeros(params_norm.shape[0], device=params_norm.device)
-            q = torch.zeros(params_norm.shape[0], device=params_norm.device)
+        carry_phys = params_norm[:, 5] * (CARRY_HI - CARRY_LO) + CARRY_LO
+        r = carry_phys.clamp(min=0.0)
+        q = (-carry_phys).clamp(min=0.0)
 
         vega_w  = compute_vega_weights(iv_flat, grid, r, q)
 
@@ -522,12 +544,14 @@ def validate(
                 mask_flat, vega_w, grid,
                 lambda_param=lambda_param,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                data_loss=data_loss,
             )
         else:
             iv_pred = model(params_norm)
             bd = total_loss(
                 iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                data_loss=data_loss,
             )
 
         sums["total"]     += bd.total.item()
@@ -616,7 +640,8 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
         h2d_s = 0.0
         compute_s = 0.0
         n_steps = 0
-        train_vega_sum = 0.0
+        train_sq_err_sum = 0.0
+        train_valid_sum = 0.0
 
         iterator = iter(train_loader)
         while True:
@@ -659,11 +684,13 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
             compute_t1 = time.perf_counter()
             compute_s += compute_t1 - compute_t0
             n_steps += 1
-            train_vega_sum += l_vega.item()
+            m = mask_flat.float()
+            train_sq_err_sum += ((iv_pred.float() - iv_flat.float()) ** 2 * m).sum().item()
+            train_valid_sum += m.sum().item()
 
         # Validation
         combined.eval()
-        val_cal_sum = val_bfly_sum = val_vega_sum = 0.0
+        val_cal_sum = val_bfly_sum = 0.0
         val_sq_err_sum = 0.0
         val_valid_sum = 0.0
         val_n = 0.0
@@ -675,18 +702,14 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
                 iv_pred = combined(params_norm)
                 val_cal_sum  += calendar_spread_penalty(iv_pred, grid, mask_flat).item()
                 val_bfly_sum += durrleman_butterfly_penalty(iv_pred, grid, mask_flat).item()
-                val_vega_batch = ((iv_pred.float() - iv_flat.float()) ** 2 * mask_flat.float()).sum(dim=1)
-                val_vega_batch = val_vega_batch / mask_flat.float().sum(dim=1).clamp(min=1.0)
-                val_vega_sum += val_vega_batch.mean().item()
                 m = mask_flat.float()
                 val_sq_err_sum += ((iv_pred.float() - iv_flat.float()) ** 2 * m).sum().item()
                 val_valid_sum += m.sum().item()
                 val_n += 1
 
-        train_vega = train_vega_sum / max(n_steps, 1)
+            train_ivrmse_bps = math.sqrt(train_sq_err_sum / max(train_valid_sum, 1.0)) * 10_000.0
         val_cal  = val_cal_sum  / max(val_n, 1)
         val_bfly = val_bfly_sum / max(val_n, 1)
-        val_vega = val_vega_sum / max(val_n, 1)
         val_ivrmse_bps = math.sqrt(val_sq_err_sum / max(val_valid_sum, 1.0)) * 10_000.0
         val_monitor = args.lambda_cal * val_cal + args.lambda_bfly * val_bfly
         scheduler.step(val_monitor)
@@ -694,12 +717,11 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
         lr_now = optimizer.param_groups[0]["lr"]
         print(
             f"epoch {epoch:4d}  lr={lr_now:.2e}  "
-            f"train_vega={train_vega:.6f}  "
-            f"val_vega={val_vega:.6f}  "
+            f"train_ivrmse={train_ivrmse_bps:.2f} bps  "
+            f"val_ivrmse={val_ivrmse_bps:.2f} bps  "
             f"wait={1e3 * batch_wait_s / max(n_steps, 1):.2f}ms  "
             f"h2d={1e3 * h2d_s / max(n_steps, 1):.2f}ms  "
             f"compute={1e3 * compute_s / max(n_steps, 1):.2f}ms  "
-            f"val_ivrmse={val_ivrmse_bps:.2f} bps  "
             f"[{time.time()-t0:.1f}s]"
         )
 
@@ -768,6 +790,9 @@ def main() -> None:
                     help="Enable dual-head training with parameter predictions for identifiability")
     ap.add_argument("--lambda-param", type=float, default=0.1,
                     help="Weight for parameter MSE term in dual-head loss (default 0.1)")
+    ap.add_argument("--data-loss", type=str, default="vega",
+                    choices=["vega", "ivrmse"],
+                    help="Data-fit loss: vega-weighted MSE or masked IV MSE (IVRMSE-style)")
     ap.add_argument("--pinn-finetune", type=str, default=None, metavar="CKPT",
                     help="PINN LoRA fine-tune mode: freeze base model from CKPT and train "
                          "a PINNAdapter with calendar + butterfly constraints only.")
@@ -893,6 +918,7 @@ def main() -> None:
     end_epoch_display = start_epoch + args.epochs if args.resume else args.epochs
     print(f"\n[training] epochs={start_epoch}→{end_epoch_display}  PINN={'off' if args.no_pinn else 'on'}")
     print(f"[training] λ_cal={lambda_cal_target}  λ_bfly={lambda_bfly_target}")
+    print(f"[training] data_loss={args.data_loss}")
     print(f"[output]   {out_dir}\n")
 
     end_epoch = start_epoch + args.epochs if args.resume else args.epochs
@@ -913,11 +939,13 @@ def main() -> None:
             time_batches=args.time_batches,
             use_dual_head=args.use_dual_head,
             lambda_param=args.lambda_param,
+            data_loss=args.data_loss,
         )
         val_m = validate(
             model, val_loader, grid, lam_cal, lam_bfly, device,
             use_dual_head=args.use_dual_head,
             lambda_param=args.lambda_param,
+            data_loss=args.data_loss,
         )
 
         # Adaptive PINN cap: if PINN/vega > 10, halve lambda targets
@@ -933,7 +961,7 @@ def main() -> None:
                       f"λ_bfly→{lambda_bfly_target:.4f}")
 
         lr_now = optimizer.param_groups[0]["lr"]
-        val_monitor = val_m["vega"]
+        val_monitor = val_m["vega"] if args.data_loss == "vega" else val_m["ivrmse_bps"]
         scheduler.step(val_monitor)
 
         ivrmse = val_m["ivrmse_bps"]
@@ -942,12 +970,11 @@ def main() -> None:
         print(
             f"epoch {epoch:4d}  "
             f"lr={lr_now:.2e}  "
-            f"train_vega={train_m['vega']:.6f}  "
-            f"val_vega={val_m['vega']:.6f}  "
+            f"train_ivrmse={train_m['ivrmse_bps']:.2f} bps  "
+            f"val_ivrmse={ivrmse:.2f} bps  "
             f"wait={train_m['batch_wait_ms']:.1f}ms  "
             f"h2d={train_m['h2d_ms']:.1f}ms  "
             f"compute={train_m['compute_ms']:.1f}ms  "
-            f"val_ivrmse={ivrmse:.2f} bps  "
             f"[{elapsed:.1f}s]"
         )
 

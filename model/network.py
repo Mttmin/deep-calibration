@@ -187,7 +187,7 @@ class BatesSurrogate(nn.Module):
     """
     Feedforward pricing surrogate θ -> (Sigma(theta), theta_aux).
 
-    Maps Heston parameter vectors (5: kappa, theta, sigma, rho, v0, all normalised to
+    Maps input vectors (6: kappa, theta, sigma_v, rho, v0, carry_norm, all normalised to
     [0, 1]) to both:
       1. Flattened IV surface (686 = 49 × 14)
       2. Auxiliary parameter predictions (5 Heston, for regularization during calibration)

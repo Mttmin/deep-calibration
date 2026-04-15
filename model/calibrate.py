@@ -14,8 +14,10 @@ Key design decisions
   not inside the closure.  Doing it inside the closure interferes with the
   strong-Wolfe line search.
 * Multi-start with Sobol quasi-random initialisations + centroid [0.5,…].
-* All optimisation is in normalised parameter space [0,1]^10.
-* Denormalisation uses the exact physical bounds from heston_datagen.py.
+* All optimisation is in normalised parameter space [0,1]^6
+  (5 Heston params + carry r−q).  Denormalisation uses the exact physical
+  bounds from heston_datagen.py — these MUST stay in sync (see
+  _check_bounds_consistency below).
 
 References
 ----------
@@ -41,16 +43,19 @@ from .loss import compute_vega_weights, ivrmse_bps
 # Parameter bounds
 # ---------------------------------------------------------------------------
 
-# Physical bounds match PARAM_BOUNDS in heston_datagen.py + CARRY_LO/HI in deep_cal.rs
+# SINGLE SOURCE OF TRUTH: these bounds MUST match PARAM_BOUNDS in
+# heston_datagen.py (training data creation/heston_datagen.py, ~line 115).
+# The ONNX model was trained with data normalised using those bounds, so any
+# mismatch here produces wrong physical parameters in CalibrateResult.theta_raw.
 # carry = r - q  (market observable, passed as 6th input; not optimised over)
 PARAM_BOUNDS_PHYSICAL = torch.tensor(
     [
-        [0.30,  8.00],   # kappa
-        [0.02,  0.12],   # theta
-        [0.05,  1.20],   # sigma_v
-        [-0.98,  0.10],  # rho
-        [0.02,  0.12],   # v0
-        [-0.04,  0.06],  # carry (r - q)
+        [0.50,  6.00],   # kappa  — matches heston_datagen.py PARAM_BOUNDS[0]
+        [0.02,  0.10],   # theta  — matches heston_datagen.py PARAM_BOUNDS[1]
+        [0.10,  0.90],   # sigma_v — matches heston_datagen.py PARAM_BOUNDS[2]
+        [-0.95, -0.20],  # rho   — matches heston_datagen.py PARAM_BOUNDS[3]
+        [0.02,  0.10],   # v0    — matches heston_datagen.py PARAM_BOUNDS[4]
+        [-0.04,  0.06],  # carry (r - q); not a training param, kept as-is
     ],
     dtype=torch.float32,
 )
@@ -62,6 +67,33 @@ PARAM_NAMES = ["kappa", "theta", "sigma_v", "rho", "v0", "carry"]
 # These extreme strikes are almost always outside the real market quote range.
 WING_LO: float = -0.50
 WING_HI: float =  0.30
+
+
+def _check_bounds_consistency() -> None:
+    """
+    Raise AssertionError if PARAM_BOUNDS_PHYSICAL[:5] diverges from the
+    training bounds stored in heston_datagen.py.  Call this in CI or when
+    loading a new checkpoint to catch parameter-space drift early.
+    """
+    import sys, os
+    datagen_dir = os.path.join(os.path.dirname(__file__), '..', 'training data creation')
+    sys.path.insert(0, datagen_dir)
+    try:
+        from heston_datagen import PARAM_BOUNDS as TRAINING_BOUNDS  # type: ignore[import]
+        calib = PARAM_BOUNDS_PHYSICAL[:5].numpy()  # only the 5 Heston params
+        tol = 1e-4
+        for i, name in enumerate(PARAM_NAMES[:5]):
+            lo_ok = abs(float(calib[i, 0]) - float(TRAINING_BOUNDS[i, 0])) < tol
+            hi_ok = abs(float(calib[i, 1]) - float(TRAINING_BOUNDS[i, 1])) < tol
+            if not lo_ok or not hi_ok:
+                raise AssertionError(
+                    f"calibrate.py PARAM_BOUNDS_PHYSICAL[{name}] = {calib[i].tolist()} "
+                    f"does not match heston_datagen.py PARAM_BOUNDS[{i}] = "
+                    f"{TRAINING_BOUNDS[i].tolist()}. "
+                    "Sync these bounds or the reported physical parameters will be wrong."
+                )
+    except ImportError:
+        pass  # heston_datagen not on path in production; skip check
 
 
 def denormalize(theta_norm: torch.Tensor) -> torch.Tensor:
@@ -101,8 +133,8 @@ def normalize(theta_raw: torch.Tensor) -> torch.Tensor:
 @dataclass
 class CalibrateResult:
     """Result of one L-BFGS calibration."""
-    theta_norm:  torch.Tensor   # (10,) normalised ∈ [0, 1]
-    theta_raw:   torch.Tensor   # (10,) physical units
+    theta_norm:  torch.Tensor   # (6,) normalised ∈ [0, 1]
+    theta_raw:   torch.Tensor   # (6,) physical units
     iv_fitted:   torch.Tensor   # (N_FLAT,) surrogate IV at calibrated params
     loss_final:  float          # final vega-weighted MSE
     ivrmse_bps:  float          # IV RMSE in basis points
@@ -121,14 +153,14 @@ def _make_theta_inits(
     guided_bank_norm: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Returns (n_restarts, 10) initialisations in [0.1, 0.9].
+    Returns (n_restarts, 6) initialisations in [0.1, 0.9].
     The first row is always the parameter centroid [0.5, …, 0.5].
     Remaining rows are drawn from guided_bank_norm (if supplied) then Sobol.
     """
     inits = []
 
     # Always include the centroid
-    inits.append(torch.full((10,), 0.5, device=device))
+    inits.append(torch.full((6,), 0.5, device=device))
 
     remaining = n_restarts - 1
     if guided_bank_norm is not None and remaining > 0 and len(guided_bank_norm) > 0:
@@ -139,8 +171,8 @@ def _make_theta_inits(
         remaining -= n_bank
 
     if remaining > 0:
-        sampler = qmc.Sobol(d=10, scramble=True, seed=seed)
-        raw = sampler.random(remaining).astype("float32")   # (remaining, 10)
+        sampler = qmc.Sobol(d=6, scramble=True, seed=seed)
+        raw = sampler.random(remaining).astype("float32")   # (remaining, 6)
         # Scale to [0.1, 0.9] to avoid boundary effects
         raw = 0.1 + 0.8 * raw
         inits.append(torch.from_numpy(raw).to(device))
@@ -157,7 +189,7 @@ def calibrate_single(
     iv_market:    torch.Tensor,          # (N_FLAT,) float32  observed IV surface
     mask_market:  torch.Tensor,          # (N_FLAT,) bool     valid market cells
     grid:         GridConstants,
-    theta_init:   torch.Tensor | None = None,  # (10,) or None → centroid
+    theta_init:   torch.Tensor | None = None,  # (6,) or None → centroid
     r_norm:       float = 0.5,           # normalised r for vega weights
     q_norm:       float = 0.5,           # normalised q for vega weights
     n_restarts:   int  = 3,
@@ -166,16 +198,16 @@ def calibrate_single(
     device:       torch.device | None = None,
     raw_mask_market:    torch.Tensor | None = None,  # (N_FLAT,) bool  raw interp mask
     confidence_market:  torch.Tensor | None = None,  # (N_FLAT,) float32  [0,1]
-    guided_bank_norm:   torch.Tensor | None = None,  # (M, 10) float32  pre-normalised
+    guided_bank_norm:   torch.Tensor | None = None,  # (M, 6) float32  pre-normalised
 ) -> CalibrateResult:
     """
     Calibrate Bates/Heston parameters to a single market IV surface.
 
     Solves:
-        θ* = argmin_{θ ∈ [0,1]^10} ‖N_w(θ) − Σ_market‖²_W
+        θ* = argmin_{θ ∈ [0,1]^6} ‖N_w(θ) − Σ_market‖²_W
 
     via multi-start L-BFGS (strong Wolfe line search) through the frozen
-    surrogate.  Box constraints are enforced by projecting back to [0,1]^10
+    surrogate.  Box constraints are enforced by projecting back to [0,1]^6
     after each L-BFGS step.
 
     Args:
@@ -183,7 +215,7 @@ def calibrate_single(
         iv_market:        (N_FLAT,) observed implied-volatility surface.
         mask_market:      (N_FLAT,) boolean mask of valid (non-NaN) market cells.
         grid:             GridConstants.
-        theta_init:       (10,) optional warm-start in normalised space [0,1].
+        theta_init:       (6,) optional warm-start in normalised space [0,1].
         r_norm:           Normalised risk-free rate for vega weight computation.
         q_norm:           Normalised dividend yield.
         n_restarts:       Number of L-BFGS restarts (including warm-start / centroid).
@@ -196,7 +228,7 @@ def calibrate_single(
         confidence_market:(N_FLAT,) per-cell confidence in [0,1].  Multiplied into
                           effective weights so high-spread / illiquid cells are
                           down-weighted.  Default: uniform 1.0.
-        guided_bank_norm: (M, 10) float32 pre-normalised parameter bank.  Used to
+        guided_bank_norm: (M, 6) float32 pre-normalised parameter bank.  Used to
                           seed multi-start restarts with market-realistic inits
                           instead of pure Sobol.  Default: Sobol only.
 
@@ -303,7 +335,7 @@ def calibrate_batch(
     iv_market_batch: torch.Tensor,       # (N, N_FLAT) float32
     mask_batch:      torch.Tensor,       # (N, N_FLAT) bool
     grid:         GridConstants,
-    theta_init_batch: torch.Tensor | None = None,  # (N, 10) float32
+    theta_init_batch: torch.Tensor | None = None,  # (N, 6) float32
     r_norm_batch:  Sequence[float] | None = None,
     q_norm_batch:  Sequence[float] | None = None,
     n_restarts:    int = 3,
@@ -312,7 +344,7 @@ def calibrate_batch(
     verbose:       bool = False,
     raw_mask_batch:     torch.Tensor | None = None,  # (N, N_FLAT) bool
     confidence_batch:   torch.Tensor | None = None,  # (N, N_FLAT) float32
-    guided_bank_norm:   torch.Tensor | None = None,  # (M, 10) float32
+    guided_bank_norm:   torch.Tensor | None = None,  # (M, 6) float32
 ) -> list[CalibrateResult]:
     """
     Calibrate a batch of N market IV surfaces.
@@ -325,7 +357,7 @@ def calibrate_batch(
         iv_market_batch:  (N, N_FLAT) market IV surfaces.
         mask_batch:       (N, N_FLAT) valid-cell masks.
         grid:             GridConstants.
-        theta_init_batch: (N, 10) optional warm-start parameters.
+        theta_init_batch: (N, 6) optional warm-start parameters.
         r_norm_batch:     List of N normalised r values (default 0.5 each).
         q_norm_batch:     List of N normalised q values (default 0.5 each).
         n_restarts:       L-BFGS multi-start restarts per surface.
@@ -334,7 +366,7 @@ def calibrate_batch(
         verbose:          Print progress per surface.
         raw_mask_batch:   (N, N_FLAT) raw market quote masks (see calibrate_single).
         confidence_batch: (N, N_FLAT) per-cell confidence weights.
-        guided_bank_norm: (M, 10) normalised guided parameter bank.
+        guided_bank_norm: (M, 6) normalised guided parameter bank.
 
     Returns:
         List of N CalibrateResult objects.
@@ -393,6 +425,9 @@ if __name__ == "__main__":
     ap.add_argument("--max-iter",   type=int, default=100)
     args = ap.parse_args()
 
+    # Verify bounds consistency before running
+    _check_bounds_consistency()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = BatesSurrogate.from_checkpoint(args.checkpoint).to(device).eval()
@@ -404,11 +439,13 @@ if __name__ == "__main__":
 
     print(f"\nCalibrating {args.n_surfaces} surfaces from val set (idx {val_start}+)…\n")
     for i in range(args.n_surfaces):
+        # params_norm layout from BatesDataset: (6,) = [kappa, theta, sigma_v, rho, v0, carry_norm]
         params_norm, iv_flat, mask_flat = ds[val_start + i]
 
-        # Ground-truth normalised parameters
-        r_norm = float(params_norm[8].item())
-        q_norm = float(params_norm[9].item())
+        # carry encodes r-q; use neutral r/q midpoints for vega-weight computation
+        # (only affects weighting, not the calibrated parameters themselves)
+        r_norm = 0.5   # corresponds to r ≈ 0.03  (mid of [0, 0.06])
+        q_norm = 0.5   # corresponds to q ≈ 0.02  (mid of [0, 0.04])
 
         res = calibrate_single(
             model       = model,
@@ -422,7 +459,7 @@ if __name__ == "__main__":
             device      = device,
         )
 
-        # Ground-truth physical params
+        # Ground-truth physical params for comparison
         gt_raw = denormalize(params_norm.to(device))
         print(f"Surface {i+1}/{args.n_surfaces}")
         print(f"  IVRMSE = {res.ivrmse_bps:.2f} bps  |  "

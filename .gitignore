@@ -38,9 +38,14 @@ pip-delete-this-directory.txt
 
 # Documentation ignored
 documentation/
+diagnostics/
+training data creation/v2/docs/
 
 # Data ignored
 *.h5
+*.pt
+*.csv
+
 
 # Ignore api keys and other secrets
 api_keys.json
@@ -48,4 +53,5 @@ api_keys.json
 # env files
 .env
 .conda/
-model/runs*
+model/runs/
+runs/

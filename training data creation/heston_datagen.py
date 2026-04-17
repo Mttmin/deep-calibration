@@ -149,6 +149,7 @@ def fill_nan_market_consistent(iv_chunk: torch.Tensor) -> torch.Tensor:
     iv = iv_chunk.clone()  # (B, NK, NT) float64
     B, n_k, n_t = iv.shape
     idx = torch.arange(n_k, device=iv.device, dtype=torch.int64)[None, :].expand(B, n_k)
+    log_iv_lo = math.log(IV_LO)
 
     for ti in range(n_t):
         col = iv[:, :, ti]                 # (B, NK)
@@ -167,23 +168,25 @@ def fill_nan_market_consistent(iv_chunk: torch.Tensor) -> torch.Tensor:
         right_idx = torch.flip(right_idx_rev, dims=[1])
         has_right = torch.flip(torch.cumsum(rev_valid.to(torch.int32), dim=1) > 0, dims=[1])
 
-        left_val = torch.gather(col, 1, left_idx)
-        right_val = torch.gather(col, 1, right_idx)
+        # Interpolate in log-IV space to preserve smile convexity.
+        col_log = torch.log(col.clamp(min=IV_LO))
+        left_val_log  = torch.gather(col_log, 1, left_idx)
+        right_val_log = torch.gather(col_log, 1, right_idx)
 
         left_dist = (idx - left_idx).to(torch.float64)
         right_dist = (right_idx - idx).to(torch.float64)
         denom = (left_dist + right_dist).clamp(min=1e-12)
-        interp = (right_val * left_dist + left_val * right_dist) / denom
+        interp_log = (right_val_log * left_dist + left_val_log * right_dist) / denom
 
-        nearest = torch.where(has_left, left_val, right_val)
-        fill_val = torch.where(has_left & has_right, interp, nearest)
-        fill_val = torch.where(
+        nearest_log = torch.where(has_left, left_val_log, right_val_log)
+        fill_val_log = torch.where(has_left & has_right, interp_log, nearest_log)
+        fill_val_log = torch.where(
             has_left | has_right,
-            fill_val,
-            torch.full_like(fill_val, IV_LO),
+            fill_val_log,
+            torch.full_like(fill_val_log, log_iv_lo),
         )
 
-        iv[:, :, ti] = torch.where(valid, col, fill_val)
+        iv[:, :, ti] = torch.where(valid, col, torch.exp(fill_val_log))
 
     iv = iv.clamp(min=IV_LO, max=IV_HI)
 
@@ -703,7 +706,10 @@ class BatesDataset(torch.utils.data.Dataset):
     """
     Returns (params_norm, iv_flat, mask_flat) or, when return_confidence=True,
     (params_norm, iv_flat, mask_flat, conf_flat):
-      params_norm : (N_PARAMS+2,) float32  normalised to [0,1] (5 Heston params + r, q)
+      params_norm : (7,) float32  normalised to [0,1]:
+                    [kappa, theta, sigma_v, rho, v0, r_norm, q_norm]
+                    — 5 Heston params + r + q each independently normalised
+                      using R_BOUNDS and Q_BOUNDS from the HDF5 metadata
       iv_flat     : (NK*NT,)      float32  IVs; NaN replaced with 0
       mask_flat   : (NK*NT,)      bool     True where IV is valid
       conf_flat   : (NK*NT,)      float32  per-cell confidence proxy (when requested)
@@ -857,10 +863,10 @@ class BatesDataset(torch.utils.data.Dataset):
         print(f"[dataset] read done in {_time.perf_counter() - t0:.1f}s — normalising …")
 
         params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
-        # Carry = r - q normalised to [0, 1] (matches CARRY_LO/HI in deep_cal.rs)
-        carry = (rq[:, 0] - rq[:, 1]).reshape(-1, 1).astype(np.float32)
-        carry_norm = (carry - CARRY_LO) / (CARRY_HI - CARRY_LO + 1e-12)
-        all_params = np.concatenate([params, carry_norm], axis=1)  # (N, 6)
+        # r and q normalised independently to [0, 1] using per-bound ranges
+        r_norm = ((rq[:, 0:1] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)).astype(np.float32)
+        q_norm = ((rq[:, 1:2] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)).astype(np.float32)
+        all_params = np.concatenate([params, r_norm, q_norm], axis=1)  # (N, 7)
         iv[~mask] = 0.0
 
         self.params_tensor = torch.from_numpy(all_params)
@@ -869,8 +875,9 @@ class BatesDataset(torch.utils.data.Dataset):
         if self.return_confidence:
             if raw_mask is None:
                 raise RuntimeError("Confidence preload requested but raw_cell_mask was not loaded")
-            conf = np.where(np.asarray(raw_mask, dtype=bool), 1.0, 0.3).astype(np.float32)
-            self.conf_tensor = torch.from_numpy(conf.reshape(len(self.idx), -1))
+            self.conf_tensor = torch.from_numpy(
+                np.asarray(raw_mask, dtype=bool).reshape(len(self.idx), -1)
+            )
 
         if self.preload_device == "cuda":
             self.params_tensor = self.params_tensor.to("cuda", non_blocking=False)
@@ -893,11 +900,14 @@ class BatesDataset(torch.utils.data.Dataset):
             if self.return_confidence:
                 if self.conf_tensor is None:
                     raise RuntimeError("return_confidence=True but confidence tensor is missing")
+                conf_row = torch.where(
+                    self.conf_tensor[i], torch.tensor(1.0), torch.tensor(0.3)
+                )
                 return (
                     self.params_tensor[i],
                     self.iv_tensor[i],
                     self.mask_tensor[i],
-                    self.conf_tensor[i],
+                    conf_row,
                 )
             return (
                 self.params_tensor[i],
@@ -913,13 +923,17 @@ class BatesDataset(torch.utils.data.Dataset):
         iv     = self._h5["iv_surface"][j].astype(np.float32)    # type: ignore  (NK, NT)
         mask   = self._h5["cell_mask"][j]                         # type: ignore  (NK, NT) bool
 
-        # Normalise Heston params + carry (r-q) → 6-element input vector
+        # Normalise Heston params + r, q independently → 7-element input vector
         params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
-        carry_norm = np.array(
-            [(rq[0] - rq[1] - CARRY_LO) / (CARRY_HI - CARRY_LO + 1e-12)],
+        r_norm = np.array(
+            [(rq[0] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)],
             dtype=np.float32,
         )
-        all_params = np.concatenate([params, carry_norm])  # (6,)
+        q_norm = np.array(
+            [(rq[1] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)],
+            dtype=np.float32,
+        )
+        all_params = np.concatenate([params, r_norm, q_norm])  # (7,)
 
         # Replace NaN with 0 in iv (loss will mask these out anyway)
         iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]
@@ -978,7 +992,9 @@ if __name__ == "__main__":
                     help="Fix r=0, q=0 for all samples (consistent with Rust inference; "
                          "makes the 5-param→IV mapping deterministic).")
     ap.add_argument("--val",   action="store_true",
-                    help="200k val set (seed+9999, appends _val.h5)")
+                    help="val set (seed+9999, appends _val.h5)")
+    ap.add_argument("--val-N", type=int, default=200_000,
+                    help="Val set size when --val is used (default 200k)")
     ap.add_argument("--check", action="store_true",
                     help="Sanity check only, no generation")
     args = ap.parse_args()
@@ -994,7 +1010,7 @@ if __name__ == "__main__":
         sanity_check(dev)
     elif args.val:
         out = args.out.replace(".h5", "") + "_val.h5"
-        generate(N=200_000, output_path=out, seed=args.seed + 9999,
+        generate(N=args.val_N, output_path=out, seed=args.seed + 9999,
                  chunk_size=args.chunk, S0=args.S0, nan_policy=args.nan_policy,
                  guided_bank_path=args.guided_bank,
                  guided_weight=args.guided_weight,

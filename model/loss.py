@@ -43,6 +43,7 @@ def compute_vega_weights(
     q: torch.Tensor,            # (B,) float32  — dividend yield (physical scale)
     S: float = 1.0,
     eps: float = 1e-6,
+    weight_floor: float = 0.0,
 ) -> torch.Tensor:
     """
     Compute Black-Scholes vega weights for each grid cell.
@@ -99,6 +100,13 @@ def compute_vega_weights(
     weights = weights.view(B, NK * NT)
     mean_w  = weights.mean(dim=1, keepdim=True).clamp(min=eps)
     weights = weights / mean_w
+
+    # Weight floor: prevents zero-gradient wings. Floor is in units of post-norm
+    # mean weight (e.g. 0.05 = 5% of ATM-normalised mean). Renormalise so mean ≈ 1.
+    if weight_floor > 0.0:
+        weights = weights.clamp(min=weight_floor)
+        mean_w  = weights.mean(dim=1, keepdim=True).clamp(min=eps)
+        weights = weights / mean_w
 
     return weights  # (B, NK*NT) float32
 
@@ -162,6 +170,24 @@ def masked_mse(
     return loss.mean()
 
 
+def masked_log_mse(
+    iv_pred:    torch.Tensor,
+    iv_target:  torch.Tensor,
+    mask:       torch.Tensor,
+    confidence: torch.Tensor | None = None,
+    floor:      float = 1e-4,
+) -> torch.Tensor:
+    """Masked MSE on log(IV) — uniform relative-error weighting across strikes."""
+    pred   = iv_pred.float().clamp(min=floor)
+    target = iv_target.float().clamp(min=floor)
+    m      = mask.float()
+    conf   = confidence.float() if confidence is not None else torch.ones_like(m)
+    w      = m * conf
+    sq_err = (torch.log(pred) - torch.log(target)) ** 2
+    loss   = (w * sq_err).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+    return loss.mean()
+
+
 # ---------------------------------------------------------------------------
 # PINN penalty 1: calendar-spread no-arbitrage
 # ---------------------------------------------------------------------------
@@ -202,13 +228,28 @@ def calendar_spread_penalty(
     # Total variance (B, NK, NT)
     tv = sigma**2 * T
 
-    # Forward differences along T (B, NK, NT-1)
+    # Adjacent forward differences along T (B, NK, NT-1)
     dtv        = tv[:, :, 1:] - tv[:, :, :-1]
     pair_valid = m[:, :, :-1] * m[:, :, 1:]   # valid only if both cells valid
 
     violations = F.relu(-dtv) ** 2             # hinge²  (B, NK, NT-1)
     n_valid    = pair_valid.sum().clamp(min=1.0)
-    return (violations * pair_valid).sum() / n_valid
+    adj_penalty = (violations * pair_valid).sum() / n_valid
+
+    # Long-range calendar check at key index pairs (1W→1M, 1M→6M, 6M→2Y).
+    # These correspond to high41x14 grid indices (0,3), (3,7), (7,11).
+    # Prevents the network from fitting adjacent differences while violating
+    # larger-scale total-variance monotonicity.
+    lr_pairs = [(0, 3), (3, 7), (7, 11)]
+    lr_pen = tv.new_zeros(())
+    for lo_t, hi_t in lr_pairs:
+        if hi_t < NT:
+            diff     = tv[:, :, hi_t] - tv[:, :, lo_t]
+            lr_valid = m[:, :, lo_t] * m[:, :, hi_t]
+            n_lr     = lr_valid.sum().clamp(min=1.0)
+            lr_pen   = lr_pen + (F.relu(-diff) ** 2 * lr_valid).sum() / n_lr
+
+    return adj_penalty + 0.5 * lr_pen
 
 
 # ---------------------------------------------------------------------------
@@ -287,14 +328,82 @@ def durrleman_butterfly_penalty(
 
 
 # ---------------------------------------------------------------------------
+# PINN penalty 3: ATM term-structure slope loss (κ identifiability)
+# ---------------------------------------------------------------------------
+
+def atm_term_structure_penalty(
+    iv_pred:   torch.Tensor,   # (B, N_FLAT)  float32 or bf16
+    iv_target: torch.Tensor,   # (B, N_FLAT)  float32
+    grid:      GridConstants,
+    mask:      torch.Tensor,   # (B, N_FLAT)  bool
+) -> torch.Tensor:
+    """
+    Penalises mismatch in the ATM implied-vol term structure slope.
+
+    Motivation: κ (mean-reversion speed) controls how fast the IV surface
+    transitions from v₀-dominated (short maturities) to θ-dominated (long
+    maturities).  With a 124 bps baseline model error, κ has only ~84 bps
+    of sensitivity signal — it becomes essentially unidentifiable.  Explicitly
+    supervising the ATM term structure slope provides a direct gradient for κ.
+
+    Definition:
+        ATM_slope = ATM_IV(T_last) − ATM_IV(T_first)   [in IV units]
+
+    We penalise the squared difference between predicted and target slopes,
+    averaged over the batch.  Only included when both endpoint cells are valid.
+
+        L_ts = mean( mask_0 * mask_last * (slope_pred - slope_target)^2 )
+
+    ATM is defined as the strike index nearest to log-moneyness = 0.
+
+    Args:
+        iv_pred:   (B, N_FLAT) predicted IV surface.
+        iv_target: (B, N_FLAT) ground-truth IV surface.
+        grid:      GridConstants.
+        mask:      (B, N_FLAT) valid-cell boolean mask.
+
+    Returns:
+        Scalar penalty (float32).
+    """
+    B  = iv_pred.shape[0]
+    NK = grid.NK
+    NT = grid.NT
+
+    pred   = iv_pred.float().view(B, NK, NT)
+    target = iv_target.float().view(B, NK, NT)
+    m      = mask.float().view(B, NK, NT)
+
+    # ATM index: strike with log-moneyness closest to 0
+    lm = grid.log_moneyness.to(iv_pred.device).float()
+    atm_ik = int(lm.abs().argmin().item())
+
+    # ATM IV at first and last maturity
+    pred_short  = pred[:, atm_ik, 0]   # (B,)
+    pred_long   = pred[:, atm_ik, -1]  # (B,)
+    target_short = target[:, atm_ik, 0]
+    target_long  = target[:, atm_ik, -1]
+
+    # Valid only when both endpoints are valid
+    valid = m[:, atm_ik, 0] * m[:, atm_ik, -1]  # (B,)
+
+    slope_pred   = pred_long   - pred_short    # (B,)
+    slope_target = target_long - target_short  # (B,)
+
+    sq_err = (slope_pred - slope_target) ** 2  # (B,)
+    n_valid = valid.sum().clamp(min=1.0)
+    return (sq_err * valid).sum() / n_valid
+
+
+# ---------------------------------------------------------------------------
 # Combined loss
 # ---------------------------------------------------------------------------
 
 class LossBreakdown(NamedTuple):
-    total:    torch.Tensor
-    vega:     torch.Tensor
-    calendar: torch.Tensor
-    butterfly: torch.Tensor
+    total:          torch.Tensor
+    vega:           torch.Tensor
+    calendar:       torch.Tensor
+    butterfly:      torch.Tensor
+    term_structure: torch.Tensor
 
 
 def total_loss(
@@ -305,16 +414,18 @@ def total_loss(
     grid:       GridConstants,
     lambda_cal:  float = 0.1,
     lambda_bfly: float = 0.05,
+    lambda_ts:   float = 0.10,
     confidence:  torch.Tensor | None = None,  # (B, N_FLAT) float32 ∈ [0,1]  optional
     data_loss:   str = "vega",
 ) -> LossBreakdown:
     """
     Combined training loss:
 
-        L = L_vega  +  λ_cal · L_calendar  +  λ_bfly · L_butterfly
+        L = L_vega  +  λ_cal · L_calendar  +  λ_bfly · L_butterfly  +  λ_ts · L_ts
 
-    where λ_cal and λ_bfly should be warmed up from 0 over epochs 10-30
+    where λ_cal, λ_bfly, and λ_ts should be warmed up from 0 over epochs 10-30
     to prevent the PINN terms from dominating before the data loss converges.
+    λ_ts targets ATM term-structure slope matching to help κ identifiability.
 
     Args:
         iv_pred:     Network output.
@@ -324,28 +435,33 @@ def total_loss(
         grid:        GridConstants.
         lambda_cal:  Weight for calendar-spread PINN penalty.
         lambda_bfly: Weight for butterfly PINN penalty.
+        lambda_ts:   Weight for ATM term-structure slope penalty (κ identifiability).
         confidence:  Optional per-cell confidence weights (see vega_weighted_mse).
 
     Returns:
-        LossBreakdown(total, vega, calendar, butterfly).
+        LossBreakdown(total, vega, calendar, butterfly, term_structure).
         All fields are scalar tensors; call .item() for logging.
     """
     if data_loss == "vega":
         l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
     elif data_loss == "ivrmse":
         l_vega = masked_mse(iv_pred, iv_target, mask, confidence=confidence)
+    elif data_loss == "log_ivrmse":
+        l_vega = masked_log_mse(iv_pred, iv_target, mask, confidence=confidence)
     else:
         raise ValueError(f"Unknown data_loss: {data_loss}")
     l_cal   = calendar_spread_penalty(iv_pred, grid, mask)
     l_bfly  = durrleman_butterfly_penalty(iv_pred, grid, mask)
+    l_ts    = atm_term_structure_penalty(iv_pred, iv_target, grid, mask)
 
-    l_total = l_vega + lambda_cal * l_cal + lambda_bfly * l_bfly
+    l_total = l_vega + lambda_cal * l_cal + lambda_bfly * l_bfly + lambda_ts * l_ts
 
     return LossBreakdown(
         total=l_total,
         vega=l_vega,
         calendar=l_cal,
         butterfly=l_bfly,
+        term_structure=l_ts,
     )
 
 
@@ -364,20 +480,23 @@ def dual_head_loss(
     lambda_param:  float = 0.1,
     lambda_cal:    float = 0.1,
     lambda_bfly:   float = 0.05,
+    lambda_ts:     float = 0.10,
     confidence:    torch.Tensor | None = None,
     data_loss:     str = "vega",
 ) -> LossBreakdown:
     """
     Combined dual-head training loss:
 
-        L = L_vega  +  λ_param · L_param  +  λ_cal · L_calendar  +  λ_bfly · L_butterfly
+        L = L_vega  +  λ_param · L_param  +  λ_cal · L_calendar
+              +  λ_bfly · L_butterfly  +  λ_ts · L_ts
 
     The auxiliary parameter prediction head helps disambiguate the parameter space
     when calibrating from IV surfaces, improving robustness to local minima.
 
     Training with parameter supervision ensures the network learns the inverse
     mapping: IV surface → 5 Heston parameters. This guides calibration toward
-    physically meaningful solutions.
+    physically meaningful solutions. λ_ts targets ATM term-structure slope
+    matching to directly supervise κ's effect on the term-structure shape.
 
     Args:
         iv_pred:       IV surface predictions (B, N_FLAT).
@@ -391,10 +510,11 @@ def dual_head_loss(
         lambda_param:  Weight for parameter MSE term. Default 0.1.
         lambda_cal:    Weight for calendar-spread PINN. Default 0.1.
         lambda_bfly:   Weight for butterfly PINN. Default 0.05.
+        lambda_ts:     Weight for ATM term-structure slope penalty (κ identifiability). Default 0.10.
         confidence:    Optional per-cell confidence weights.
 
     Returns:
-        LossBreakdown(total, vega, calendar, butterfly).
+        LossBreakdown(total, vega, calendar, butterfly, term_structure).
         Note: The 'vega' field includes IV MSE; parameter MSE is implicit in total.
     """
     # IV data loss (vega-weighted MSE or plain masked MSE)
@@ -402,26 +522,36 @@ def dual_head_loss(
         l_vega = vega_weighted_mse(iv_pred, iv_target, mask, weights, confidence=confidence)
     elif data_loss == "ivrmse":
         l_vega = masked_mse(iv_pred, iv_target, mask, confidence=confidence)
+    elif data_loss == "log_ivrmse":
+        l_vega = masked_log_mse(iv_pred, iv_target, mask, confidence=confidence)
     else:
         raise ValueError(f"Unknown data_loss: {data_loss}")
 
-    # Parameter MSE loss (L2 distance between predicted and true Heston params)
+    # Parameter MSE loss: weighted by inverse IV sensitivity.
+    # κ has the weakest IV fingerprint (~84 bps range); ρ has the strongest (~400 bps).
+    # Upweighting high-sensitivity params improves calibration of the slow-learning κ.
+    # Order must match training data: [kappa, theta, sigma_v, rho, v0].
     param_pred_f = param_pred.float()
     param_target_f = param_target.float()
-    l_param = F.mse_loss(param_pred_f, param_target_f)
+    _PARAM_WEIGHTS = torch.tensor([1.0, 3.0, 2.5, 5.0, 3.0], device=param_pred_f.device)
+    sq_err = (param_pred_f - param_target_f) ** 2
+    l_param = (sq_err * _PARAM_WEIGHTS).mean()
 
     # PINN penalties (as before)
-    l_cal = calendar_spread_penalty(iv_pred, grid, mask)
+    l_cal  = calendar_spread_penalty(iv_pred, grid, mask)
     l_bfly = durrleman_butterfly_penalty(iv_pred, grid, mask)
+    l_ts   = atm_term_structure_penalty(iv_pred, iv_target, grid, mask)
 
-    # Combined loss with parameter regularization
-    l_total = l_vega + lambda_param * l_param + lambda_cal * l_cal + lambda_bfly * l_bfly
+    # Combined loss with parameter regularization and term-structure penalty
+    l_total = (l_vega + lambda_param * l_param + lambda_cal * l_cal
+               + lambda_bfly * l_bfly + lambda_ts * l_ts)
 
     return LossBreakdown(
         total=l_total,
         vega=l_vega,  # Contains IV MSE; param MSE is implicit in l_total
         calendar=l_cal,
         butterfly=l_bfly,
+        term_structure=l_ts,
     )
 
 
@@ -472,6 +602,12 @@ if __name__ == "__main__":
     w = compute_vega_weights(target, grid, r, q)
     print(f"Vega weights  shape={w.shape}  min={w.min():.4f}  max={w.max():.4f}  mean={w.mean():.4f}")
     assert abs(w.mean().item() - 1.0) < 0.1, "weights should be ~1 on average"
+
+    # Vega weights with floor
+    w_floor = compute_vega_weights(target, grid, r, q, weight_floor=0.05)
+    print(f"Floored weights  min={w_floor.min():.4f}  max={w_floor.max():.4f}  mean={w_floor.mean():.4f}")
+    assert w_floor.min().item() >= 0.05 * 0.9, "floored weights should respect floor after renorm"
+    assert abs(w_floor.mean().item() - 1.0) < 0.1, "floored weights should still be ~1 mean"
 
     # Losses
     lv  = vega_weighted_mse(pred, target, mask, w)

@@ -24,10 +24,10 @@ Usage
 Training details
 ----------------
   Precision:    BF16 autocast (forward), FP32 (loss)
-  Optimizer:    Adam  lr=1e-3, weight_decay=1e-5
+  Optimizer:    Adam  lr=3e-4, weight_decay=1e-5
   Scheduler:    ReduceLROnPlateau  factor=0.5, patience=10
   Grad clip:    max_norm=1.0
-  PINN warmup:  λ_cal and λ_bfly ramped from 0 over epochs 10-30
+  PINN warmup:  λ_cal and λ_bfly ramped from 0 over epochs 15-25
   Target:       val IVRMSE < 10 bps
 
 References
@@ -65,7 +65,10 @@ from model.loss import (
 
 # BatesDataset lives in the data-generation script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training data creation"))
-from heston_datagen import BatesDataset, CARRY_LO, CARRY_HI   # type: ignore[import]
+from heston_datagen import BatesDataset, R_BOUNDS, Q_BOUNDS   # type: ignore[import]
+
+MARKET_R_LO, MARKET_R_HI = float(R_BOUNDS[0]), float(R_BOUNDS[1])
+MARKET_Q_LO, MARKET_Q_HI = float(Q_BOUNDS[0]), float(Q_BOUNDS[1])
 
 
 # ---------------------------------------------------------------------------
@@ -114,11 +117,11 @@ def _h5_shape(h5_path: str) -> tuple[int, int, int]:
 
 
 def _bytes_per_sample(nk: int, nt: int, include_confidence: bool) -> int:
-    # params_norm(10 float32), iv(float32), mask(bool), optional confidence(float32)
+    # params_norm(10 float32), iv(float32), mask(bool), optional confidence(bool)
     n_flat = nk * nt
     total = (10 * 4) + (n_flat * 4) + n_flat
     if include_confidence:
-        total += n_flat * 4
+        total += n_flat
     return total
 
 
@@ -367,21 +370,33 @@ def _pinn_lambdas(
     epoch: int,
     target_cal:  float,
     target_bfly: float,
-    warmup_start: int = 10,
-    warmup_end:   int = 30,
-) -> tuple[float, float]:
+    target_ts:   float,
+    warmup_start: int = 15,
+    warmup_end:   int = 25,
+    ts_warmup_end: int = 35,
+) -> tuple[float, float, float]:
     """
     Linear warmup of PINN penalty weights:
       epochs  0 – warmup_start-1  : λ = 0
-      epochs  warmup_start – warmup_end : linear ramp 0 → target
+      epochs  warmup_start – warmup_end : linear ramp 0 → target (cal, bfly)
+      epochs  warmup_start – ts_warmup_end : linear ramp 0 → target (ts)
       epochs  warmup_end+ : λ = target
+
+    λ_ts uses ts_warmup_end (default 35) so the network first converges on the
+    IV surface shape (epochs 0-25) before the term-structure κ gradient is applied.
     """
-    if epoch < warmup_start:
-        return 0.0, 0.0
-    if epoch >= warmup_end:
-        return target_cal, target_bfly
-    frac = (epoch - warmup_start) / max(1, warmup_end - warmup_start)
-    return target_cal * frac, target_bfly * frac
+    def _ramp(target: float, end: int) -> float:
+        if epoch < warmup_start or target == 0.0:
+            return 0.0
+        if epoch >= end:
+            return target
+        return target * (epoch - warmup_start) / max(1, end - warmup_start)
+
+    return (
+        _ramp(target_cal,  warmup_end),
+        _ramp(target_bfly, warmup_end),
+        _ramp(target_ts,   ts_warmup_end),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +416,13 @@ def train_one_epoch(
     time_batches: bool = False,
     use_dual_head: bool = False,
     lambda_param: float = 0.1,
+    lambda_ts:    float = 0.0,
     data_loss: str = "vega",
+    weight_floor: float = 0.0,
 ) -> dict[str, float]:
     model.train()
 
-    sums  = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0)
+    sums  = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0, term_structure=0.0)
     sq_err_sum = 0.0
     valid_sum = 0.0
     steps = 0
@@ -434,15 +451,14 @@ def train_one_epoch(
         h2d_t1 = time.perf_counter()
         h2d_s += h2d_t1 - h2d_t0
 
-        # Denormalise carry (r-q) for vega weight computation.
-        # Slot 5 is carry_norm = (r-q - CARRY_LO) / (CARRY_HI - CARRY_LO).
+        # Denormalise r and q from slots 5 and 6 (independently normalised).
+        # params_norm layout: [kappa, theta, sigma_v, rho, v0, r_norm, q_norm]
         compute_t0 = time.perf_counter()
-        carry_phys = params_norm[:, 5] * (CARRY_HI - CARRY_LO) + CARRY_LO
-        r = carry_phys.clamp(min=0.0)
-        q = (-carry_phys).clamp(min=0.0)
+        r = params_norm[:, 5] * (MARKET_R_HI - MARKET_R_LO) + MARKET_R_LO
+        q = params_norm[:, 6] * (MARKET_Q_HI - MARKET_Q_LO) + MARKET_Q_LO
 
         # Vega weights: computed in float32 on the ground-truth IV
-        vega_w = compute_vega_weights(iv_flat, grid, r, q)
+        vega_w = compute_vega_weights(iv_flat, grid, r, q, weight_floor=weight_floor)
 
         # Forward pass in BF16
         with amp.autocast("cuda", dtype=torch.bfloat16):
@@ -453,14 +469,15 @@ def train_one_epoch(
 
         # Loss in FP32 (cast iv_pred here; grid passed directly)
         if use_dual_head:
-            # Extract 5 Heston parameters only (first 5 of the 7: 5 Heston + r + q)
-            # The parameter head learns to predict ONLY the Heston params; r and q are market inputs
+            # First 5 slots are Heston params; slots 5 and 6 are r and q (market inputs).
+            # The auxiliary parameter head predicts ONLY the 5 Heston params.
             param_target = params_norm[:, :5]
             bd = dual_head_loss(
                 iv_pred.float(), param_pred.float(), iv_flat, param_target,
                 mask_flat, vega_w, grid,
                 lambda_param=lambda_param,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                lambda_ts=lambda_ts,
                 confidence=conf_flat,
                 data_loss=data_loss,
             )
@@ -468,6 +485,7 @@ def train_one_epoch(
             bd = total_loss(
                 iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                lambda_ts=lambda_ts,
                 confidence=conf_flat,
                 data_loss=data_loss,
             )
@@ -483,10 +501,11 @@ def train_one_epoch(
         compute_t1 = time.perf_counter()
         compute_s += compute_t1 - compute_t0
 
-        sums["total"]     += bd.total.item()
-        sums["vega"]      += bd.vega.item()
-        sums["calendar"]  += bd.calendar.item()
-        sums["butterfly"] += bd.butterfly.item()
+        sums["total"]          += bd.total.item()
+        sums["vega"]           += bd.vega.item()
+        sums["calendar"]       += bd.calendar.item()
+        sums["butterfly"]      += bd.butterfly.item()
+        sums["term_structure"] += bd.term_structure.item()
         m = mask_flat.float()
         sq_err_sum += ((iv_pred.float() - iv_flat) ** 2 * m).sum().item()
         valid_sum += m.sum().item()
@@ -515,11 +534,13 @@ def validate(
     device:      torch.device,
     use_dual_head: bool = False,
     lambda_param: float = 0.1,
+    lambda_ts:    float = 0.0,
     data_loss: str = "vega",
+    weight_floor: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
 
-    sums    = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0)
+    sums    = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0, term_structure=0.0)
     sq_err_sum = 0.0
     valid_sum  = 0.0
     steps      = 0
@@ -529,21 +550,21 @@ def validate(
         iv_flat     = batch[1].to(device, non_blocking=True)
         mask_flat   = batch[2].to(device, non_blocking=True)
 
-        carry_phys = params_norm[:, 5] * (CARRY_HI - CARRY_LO) + CARRY_LO
-        r = carry_phys.clamp(min=0.0)
-        q = (-carry_phys).clamp(min=0.0)
+        r = params_norm[:, 5] * (MARKET_R_HI - MARKET_R_LO) + MARKET_R_LO
+        q = params_norm[:, 6] * (MARKET_Q_HI - MARKET_Q_LO) + MARKET_Q_LO
 
-        vega_w  = compute_vega_weights(iv_flat, grid, r, q)
+        vega_w  = compute_vega_weights(iv_flat, grid, r, q, weight_floor=weight_floor)
 
         if use_dual_head:
             iv_pred, param_pred = model.forward_dual(params_norm)
-            # Parameter head predicts ONLY 5 Heston params; r and q are market inputs, not learned
+            # First 5 slots are Heston params; slots 5 and 6 are r and q (market inputs).
             param_target = params_norm[:, :5]
             bd = dual_head_loss(
                 iv_pred.float(), param_pred.float(), iv_flat, param_target,
                 mask_flat, vega_w, grid,
                 lambda_param=lambda_param,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                lambda_ts=lambda_ts,
                 data_loss=data_loss,
             )
         else:
@@ -551,13 +572,15 @@ def validate(
             bd = total_loss(
                 iv_pred.float(), iv_flat, mask_flat, vega_w, grid,
                 lambda_cal=lambda_cal, lambda_bfly=lambda_bfly,
+                lambda_ts=lambda_ts,
                 data_loss=data_loss,
             )
 
-        sums["total"]     += bd.total.item()
-        sums["vega"]      += bd.vega.item()
-        sums["calendar"]  += bd.calendar.item()
-        sums["butterfly"] += bd.butterfly.item()
+        sums["total"]          += bd.total.item()
+        sums["vega"]           += bd.vega.item()
+        sums["calendar"]       += bd.calendar.item()
+        sums["butterfly"]      += bd.butterfly.item()
+        sums["term_structure"] += bd.term_structure.item()
 
         m  = mask_flat.float()
         sq_err_sum += ((iv_pred.float() - iv_flat) ** 2 * m).sum().item()
@@ -719,9 +742,9 @@ def _run_pinn_finetune(args, device, grid, train_loader, val_loader) -> None:
             f"epoch {epoch:4d}  lr={lr_now:.2e}  "
             f"train_ivrmse={train_ivrmse_bps:.2f} bps  "
             f"val_ivrmse={val_ivrmse_bps:.2f} bps  "
-            f"wait={1e3 * batch_wait_s / max(n_steps, 1):.2f}ms  "
-            f"h2d={1e3 * h2d_s / max(n_steps, 1):.2f}ms  "
-            f"compute={1e3 * compute_s / max(n_steps, 1):.2f}ms  "
+            # f"wait={1e3 * batch_wait_s / max(n_steps, 1):.2f}ms  "
+            # f"h2d={1e3 * h2d_s / max(n_steps, 1):.2f}ms  "
+            # f"compute={1e3 * compute_s / max(n_steps, 1):.2f}ms  "
             f"[{time.time()-t0:.1f}s]"
         )
 
@@ -762,11 +785,11 @@ def main() -> None:
                     help="Dropout used in trunk and heads")
     ap.add_argument("--batch-size",  type=int,   default=8196)
     ap.add_argument("--epochs",      type=int,   default=200)
-    ap.add_argument("--lr",          type=float, default=1e-3)
+    ap.add_argument("--lr",          type=float, default=3e-4)
     ap.add_argument("--weight-decay",type=float, default=1e-5)
-    ap.add_argument("--lambda-cal",  type=float, default=0.10,
+    ap.add_argument("--lambda-cal",  type=float, default=0.01,
                     help="Calendar-spread PINN weight (at full warmup)")
-    ap.add_argument("--lambda-bfly", type=float, default=0.05,
+    ap.add_argument("--lambda-bfly", type=float, default=0.005,
                     help="Butterfly PINN weight (at full warmup)")
     ap.add_argument("--grad-clip",   type=float, default=1.0)
     ap.add_argument("--num-workers", type=int,   default=8)
@@ -783,6 +806,9 @@ def main() -> None:
                     help="Preload mode: none/train/all or auto (VRAM -> RAM -> disk)")
     ap.add_argument("--confidence",   action="store_true",
                     help="Use per-cell confidence weights in training loss (fine-tune mode)")
+    ap.add_argument("--weight-floor", type=float, default=0.0,
+                    help="Vega weight floor (post-norm units). 0 = off. 0.05 recommended "
+                         "to prevent zero-gradient wings.")
     ap.add_argument("--time-batches", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="Measure DataLoader wait, host-to-device copy, and compute time per batch")
@@ -790,9 +816,11 @@ def main() -> None:
                     help="Enable dual-head training with parameter predictions for identifiability")
     ap.add_argument("--lambda-param", type=float, default=0.1,
                     help="Weight for parameter MSE term in dual-head loss (default 0.1)")
-    ap.add_argument("--data-loss", type=str, default="vega",
-                    choices=["vega", "ivrmse"],
-                    help="Data-fit loss: vega-weighted MSE or masked IV MSE (IVRMSE-style)")
+    ap.add_argument("--lambda-ts", type=float, default=0.003,
+                    help="Weight for ATM term-structure slope penalty (κ identifiability, default 0.03)")
+    ap.add_argument("--data-loss", type=str, default="ivrmse",
+                    choices=["vega", "ivrmse", "log_ivrmse"],
+                    help="Data-fit loss: vega-weighted MSE, masked IV MSE, or log(IV) MSE (relative)")
     ap.add_argument("--pinn-finetune", type=str, default=None, metavar="CKPT",
                     help="PINN LoRA fine-tune mode: freeze base model from CKPT and train "
                          "a PINNAdapter with calendar + butterfly constraints only.")
@@ -800,6 +828,8 @@ def main() -> None:
                     help="Bottleneck rank for PINNAdapter (default 32)")
     ap.add_argument("--lora-vega-weight", type=float, default=0.05,
                     help="Weight of vega loss during PINN fine-tune to prevent IV drift (default 0.05)")
+    ap.add_argument("--ckpt-start", type=int, default=25,
+                    help="Epoch from which best-checkpoint tracking begins (default 25; set low for no-pinn runs)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -856,7 +886,7 @@ def main() -> None:
 
     # Model
     model_config = dict(
-        n_params  = 6,   # 5 Heston params + carry (r-q)
+        n_params  = 7,   # 5 Heston params + r + q (each independently normalised)
         n_outputs = grid.N_FLAT,
         width     = args.width,
         n_blocks  = args.n_blocks,
@@ -881,7 +911,7 @@ def main() -> None:
     best_val_ivrmse = float("inf")
     best_val_monitor = float("inf")
     no_improve_count = 0
-    warmup_end = 30
+    warmup_end = args.ckpt_start
 
     # Resume
     if args.resume:
@@ -901,9 +931,9 @@ def main() -> None:
     # Write CSV header
     fieldnames = [
         "epoch", "lr",
-        "train_total", "train_vega", "train_cal", "train_bfly",
+        "train_total", "train_vega", "train_cal", "train_bfly", "train_ts",
         "train_batch_wait_ms", "train_h2d_ms", "train_compute_ms",
-        "val_total", "val_vega", "val_cal", "val_bfly",
+        "val_total", "val_vega", "val_cal", "val_bfly", "val_ts",
         "val_ivrmse_bps",
     ]
     write_header = not log_path.exists()
@@ -914,10 +944,11 @@ def main() -> None:
 
     lambda_cal_target  = 0.0 if args.no_pinn else args.lambda_cal
     lambda_bfly_target = 0.0 if args.no_pinn else args.lambda_bfly
+    lambda_ts_target   = 0.0 if args.no_pinn else args.lambda_ts
 
     end_epoch_display = start_epoch + args.epochs if args.resume else args.epochs
     print(f"\n[training] epochs={start_epoch}→{end_epoch_display}  PINN={'off' if args.no_pinn else 'on'}")
-    print(f"[training] λ_cal={lambda_cal_target}  λ_bfly={lambda_bfly_target}")
+    print(f"[training] λ_cal={lambda_cal_target}  λ_bfly={lambda_bfly_target}  λ_ts={lambda_ts_target}")
     print(f"[training] data_loss={args.data_loss}")
     print(f"[output]   {out_dir}\n")
 
@@ -925,9 +956,9 @@ def main() -> None:
     for epoch in range(start_epoch, end_epoch):
         t0 = time.time()
 
-        # Current PINN lambdas (warmed up over epochs 10-30)
-        lam_cal, lam_bfly = _pinn_lambdas(
-            epoch, lambda_cal_target, lambda_bfly_target
+        # Current PINN lambdas (warmed up over epochs 15-25)
+        lam_cal, lam_bfly, lam_ts = _pinn_lambdas(
+            epoch, lambda_cal_target, lambda_bfly_target, lambda_ts_target
         )
 
         # Auto-reduce PINN lambdas if they dominate (>10× data loss)
@@ -939,29 +970,36 @@ def main() -> None:
             time_batches=args.time_batches,
             use_dual_head=args.use_dual_head,
             lambda_param=args.lambda_param,
+            lambda_ts=lam_ts,
             data_loss=args.data_loss,
+            weight_floor=args.weight_floor,
         )
         val_m = validate(
             model, val_loader, grid, lam_cal, lam_bfly, device,
             use_dual_head=args.use_dual_head,
             lambda_param=args.lambda_param,
+            lambda_ts=lam_ts,
             data_loss=args.data_loss,
+            weight_floor=args.weight_floor,
         )
 
         # Adaptive PINN cap: if PINN/vega > 10, halve lambda targets
         if not args.no_pinn and epoch >= 30:
             pinn_total = (
                 lambda_cal_target  * val_m["calendar"] +
-                lambda_bfly_target * val_m["butterfly"]
+                lambda_bfly_target * val_m["butterfly"] +
+                lambda_ts_target   * val_m["term_structure"]
             )
             if val_m["vega"] > 1e-12 and pinn_total / val_m["vega"] > 10.0:
                 lambda_cal_target  *= 0.5
                 lambda_bfly_target *= 0.5
+                lambda_ts_target   *= 0.5
                 print(f"  [pinn cap]  λ_cal→{lambda_cal_target:.4f}  "
-                      f"λ_bfly→{lambda_bfly_target:.4f}")
+                      f"λ_bfly→{lambda_bfly_target:.4f}  "
+                      f"λ_ts→{lambda_ts_target:.4f}")
 
         lr_now = optimizer.param_groups[0]["lr"]
-        val_monitor = val_m["vega"] if args.data_loss == "vega" else val_m["ivrmse_bps"]
+        val_monitor = val_m["ivrmse_bps"]
         scheduler.step(val_monitor)
 
         ivrmse = val_m["ivrmse_bps"]
@@ -970,11 +1008,14 @@ def main() -> None:
         print(
             f"epoch {epoch:4d}  "
             f"lr={lr_now:.2e}  "
+            f"train_vega={train_m['vega']:.6f}  "
             f"train_ivrmse={train_m['ivrmse_bps']:.2f} bps  "
+            f"val_vega={val_m['vega']:.6f}  "
+            f"val_total={val_m['total']:.6f}  "
             f"val_ivrmse={ivrmse:.2f} bps  "
-            f"wait={train_m['batch_wait_ms']:.1f}ms  "
-            f"h2d={train_m['h2d_ms']:.1f}ms  "
-            f"compute={train_m['compute_ms']:.1f}ms  "
+            # f"wait={train_m['batch_wait_ms']:.1f}ms  "
+            # f"h2d={train_m['h2d_ms']:.1f}ms  "
+            # f"compute={train_m['compute_ms']:.1f}ms  "
             f"[{elapsed:.1f}s]"
         )
 
@@ -986,6 +1027,7 @@ def main() -> None:
             "train_vega":     train_m["vega"],
             "train_cal":      train_m["calendar"],
             "train_bfly":     train_m["butterfly"],
+            "train_ts":       train_m["term_structure"],
             "train_batch_wait_ms": train_m["batch_wait_ms"],
             "train_h2d_ms":        train_m["h2d_ms"],
             "train_compute_ms":    train_m["compute_ms"],
@@ -993,6 +1035,7 @@ def main() -> None:
             "val_vega":       val_m["vega"],
             "val_cal":        val_m["calendar"],
             "val_bfly":       val_m["butterfly"],
+            "val_ts":         val_m["term_structure"],
             "val_ivrmse_bps": ivrmse,
         }
         writer.writerow(row)

@@ -512,6 +512,19 @@ CARRY_LO: float = R_BOUNDS[0] - Q_BOUNDS[1]  # -0.04: min(r) - max(q)
 CARRY_HI: float = R_BOUNDS[1] - Q_BOUNDS[0]  #  0.06: max(r) - min(q)
 
 
+# v2 pipeline (Phase 3.2): realistic prior + per-cell quality_mask. Schema
+# differs — params is 6-wide (kappa, theta, sigma_v, rho, v0, r), q is fixed
+# at 0, and per-cell validity is encoded as quality_mask uint8 ∈ {0..3}
+# (0=cos_standard, 1=cos_extended, 2=cos_small_price, 3=unpricable). Bounds
+# are duplicated from training data creation/v2/sampling.py to avoid making
+# this module depend on the v2 sub-package.
+V2_PARAM_LO: np.ndarray = np.array([0.30, 0.01, 0.10, -0.90, 0.02], dtype=np.float64)
+V2_PARAM_HI: np.ndarray = np.array([10.0, 0.16, 1.50, -0.30, 0.20], dtype=np.float64)
+V2_R_BOUNDS: tuple[float, float] = (0.00, 0.05)
+V2_Q_FIXED: float = 0.0
+V2_QM_GOOD_MAX: int = 1   # train on cells with qm <= 1 (cos_standard or cos_extended)
+
+
 #  Main generation loop
 
 def generate(
@@ -738,6 +751,11 @@ class BatesDataset(torch.utils.data.Dataset):
 
         indices: optional positions within the filtered valid-sample array.
         preload: if True, materialise the selected split into RAM once.
+
+        Format detection: presence of `quality_mask` dataset switches the
+        loader to v2 (Phase 3.2) mode — params width is 6 (kappa, theta,
+        sigma_v, rho, v0, r), q is fixed at 0, and the per-cell training
+        mask is derived from quality_mask <= V2_QM_GOOD_MAX.
         """
         self.h5_path = h5_path
         self._h5     = None
@@ -748,6 +766,8 @@ class BatesDataset(torch.utils.data.Dataset):
         self.iv_tensor: torch.Tensor | None = None
         self.mask_tensor: torch.Tensor | None = None
         self.conf_tensor: torch.Tensor | None = None
+        self.is_v2 = False
+        self.pricable_region: np.ndarray | None = None
 
         if self.preload_device not in {"cpu", "cuda"}:
             raise ValueError(f"Unknown preload device: {self.preload_device}")
@@ -755,36 +775,78 @@ class BatesDataset(torch.utils.data.Dataset):
             raise RuntimeError("CUDA preload requested but CUDA is unavailable")
 
         with h5py.File(h5_path, "r") as f:
-            nk = int(f.attrs.get("NK", f["iv_surface"].shape[1])) # type: ignore
-            nt = int(f.attrs.get("NT", f["iv_surface"].shape[2])) # type: ignore
+            self.is_v2 = "quality_mask" in f
+            iv_shape = f["iv_surface"].shape  # type: ignore
+            nk = int(f.attrs.get("NK", iv_shape[1]))  # type: ignore
+            nt = int(f.attrs.get("NT", iv_shape[2]))  # type: ignore
             self.nk = nk
             self.nt = nt
             default_min_valid = int(math.ceil(0.5 * nk * nt))
             self.min_valid_cells = default_min_valid if min_valid_cells is None else min_valid_cells
 
-            vc            = f["valid_count"][:] # type: ignore
-            valid_idx     = np.where(vc >= self.min_valid_cells)[0] # type: ignore
+            if self.is_v2:
+                if self.return_confidence:
+                    raise NotImplementedError(
+                        "return_confidence is not supported on v2 datasets "
+                        "(no raw_cell_mask in v2 schema)"
+                    )
+                self.param_lo = V2_PARAM_LO.astype(np.float32)
+                self.param_hi = V2_PARAM_HI.astype(np.float32)
+                # market_lo/hi cover [r, q]: q is fixed at 0 in v2 so we
+                # encode that as a degenerate range and emit q_norm = 0.
+                self.market_lo = np.array(
+                    [V2_R_BOUNDS[0], V2_Q_FIXED], dtype=np.float32
+                )
+                self.market_hi = np.array(
+                    [V2_R_BOUNDS[1], V2_Q_FIXED], dtype=np.float32
+                )
+                self.pricable_region = np.asarray(f["pricable_region"][:], dtype=bool)  # type: ignore
+
+                if self.min_valid_cells > 0:
+                    vc = self._compute_v2_valid_count(f)
+                    valid_idx = np.where(vc >= self.min_valid_cells)[0]
+                else:
+                    valid_idx = np.arange(int(iv_shape[0]), dtype=np.int64)
+            else:
+                self.param_lo = np.array(f.attrs["param_lo"], dtype=np.float32)
+                self.param_hi = np.array(f.attrs["param_hi"], dtype=np.float32)
+                r_bounds = np.array(f.attrs.get("r_bounds", [0.0, 0.06]), dtype=np.float32)
+                q_bounds = np.array(f.attrs.get("q_bounds", [0.0, 0.04]), dtype=np.float32)
+                self.market_lo = np.array([r_bounds[0], q_bounds[0]], dtype=np.float32)
+                self.market_hi = np.array([r_bounds[1], q_bounds[1]], dtype=np.float32)
+                vc = f["valid_count"][:]  # type: ignore
+                valid_idx = np.where(vc >= self.min_valid_cells)[0]  # type: ignore
+
             if indices is not None:
                 split_idx = np.asarray(indices, dtype=np.int64)
                 self.idx = valid_idx[split_idx]
             else:
                 self.idx = valid_idx
-            self.param_lo = np.array(f.attrs["param_lo"], dtype=np.float32)
-            self.param_hi = np.array(f.attrs["param_hi"], dtype=np.float32)
-            # r, q bounds for normalization
-            r_bounds = np.array(f.attrs.get("r_bounds", [0.0, 0.06]), dtype=np.float32)
-            q_bounds = np.array(f.attrs.get("q_bounds", [0.0, 0.04]), dtype=np.float32)
-            self.market_lo = np.array([r_bounds[0], q_bounds[0]], dtype=np.float32)
-            self.market_hi = np.array([r_bounds[1], q_bounds[1]], dtype=np.float32)
 
         print(
             f"[dataset] {h5_path}: {len(self.idx):,} samples "
-            f"(min_valid_cells={self.min_valid_cells}, "
+            f"(format={'v2' if self.is_v2 else 'v1'}, "
+            f"min_valid_cells={self.min_valid_cells}, "
             f"preload={'yes' if self.preload else 'no'}:{self.preload_device})"
         )
 
         if self.preload:
             self._preload_into_ram()
+
+    @staticmethod
+    def _compute_v2_valid_count(f: h5py.File, chunk: int = 65_536) -> np.ndarray:
+        """Stream `quality_mask` in row-chunks to derive per-surface valid_count.
+
+        Avoids materialising the full (N, NK, NT) uint8 dataset (~7 GB at 10M).
+        """
+        qm = f["quality_mask"]  # type: ignore
+        n = qm.shape[0]
+        out = np.empty(n, dtype=np.int64)
+        for i0 in range(0, n, chunk):
+            i1 = min(i0 + chunk, n)
+            block = qm[i0:i1]  # type: ignore
+            out[i0:i1] = (block <= V2_QM_GOOD_MAX).reshape(i1 - i0, -1).sum(axis=1)
+        return out
 
     def _estimate_preload_bytes(self) -> int:
         n = len(self.idx)
@@ -833,41 +895,74 @@ class BatesDataset(torch.utils.data.Dataset):
         with concurrent.futures.ThreadPoolExecutor(max_workers=io_threads) as ex:
             if is_contiguous:
                 # Split the big iv_surface read across multiple threads;
-                # params/market_params/cell_mask are small — one thread each.
+                # the per-row metadata datasets are small — one thread each.
                 chunk = max(1, (i1 - i0 + io_threads - 4) // (io_threads - 3))
                 iv_futures = [
                     ex.submit(_read_slice, "iv_surface", np.float32,
                               s, min(s + chunk, i1))
                     for s in range(i0, i1, chunk)
                 ]
-                f_params = ex.submit(_read_slice, "params",        np.float32, i0, i1)
-                f_rq     = ex.submit(_read_slice, "market_params", np.float32, i0, i1)
-                f_mask   = ex.submit(_read_slice, "cell_mask",     bool,       i0, i1)
-                f_raw    = ex.submit(_read_slice, "raw_cell_mask", bool,       i0, i1) if self.return_confidence else None
+                f_params = ex.submit(_read_slice, "params", np.float32, i0, i1)
+                if self.is_v2:
+                    f_qm = ex.submit(_read_slice, "quality_mask", np.uint8, i0, i1)
+                    f_rq = None
+                    f_mask = None
+                    f_raw = None
+                else:
+                    f_rq   = ex.submit(_read_slice, "market_params", np.float32, i0, i1)
+                    f_mask = ex.submit(_read_slice, "cell_mask",     bool,       i0, i1)
+                    f_qm   = None
+                    f_raw  = ex.submit(_read_slice, "raw_cell_mask", bool,       i0, i1) if self.return_confidence else None
                 params = f_params.result()
-                rq     = f_rq.result()
-                mask   = f_mask.result()
+                rq     = f_rq.result() if f_rq is not None else None
+                mask   = f_mask.result() if f_mask is not None else None
+                qm     = f_qm.result() if f_qm is not None else None
                 raw_mask = f_raw.result() if f_raw is not None else None
                 iv     = np.concatenate([ft.result() for ft in iv_futures], axis=0)
             else:
                 f_params = ex.submit(_read_fancy, "params",        np.float32)
-                f_rq     = ex.submit(_read_fancy, "market_params", np.float32)
                 f_iv     = ex.submit(_read_fancy, "iv_surface",    np.float32)
-                f_mask   = ex.submit(_read_fancy, "cell_mask",     bool)
-                f_raw    = ex.submit(_read_fancy, "raw_cell_mask", bool) if self.return_confidence else None
+                if self.is_v2:
+                    f_qm = ex.submit(_read_fancy, "quality_mask", np.uint8)
+                    f_rq = None
+                    f_mask = None
+                    f_raw = None
+                else:
+                    f_rq   = ex.submit(_read_fancy, "market_params", np.float32)
+                    f_mask = ex.submit(_read_fancy, "cell_mask",     bool)
+                    f_qm   = None
+                    f_raw  = ex.submit(_read_fancy, "raw_cell_mask", bool) if self.return_confidence else None
                 params = f_params.result()
-                rq     = f_rq.result()
+                rq     = f_rq.result() if f_rq is not None else None
                 iv     = f_iv.result()
-                mask   = f_mask.result()
+                mask   = f_mask.result() if f_mask is not None else None
+                qm     = f_qm.result() if f_qm is not None else None
                 raw_mask = f_raw.result() if f_raw is not None else None
         print(f"[dataset] read done in {_time.perf_counter() - t0:.1f}s — normalising …")
 
-        params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
-        # r and q normalised independently to [0, 1] using per-bound ranges
-        r_norm = ((rq[:, 0:1] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)).astype(np.float32)
-        q_norm = ((rq[:, 1:2] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)).astype(np.float32)
-        all_params = np.concatenate([params, r_norm, q_norm], axis=1)  # (N, 7)
-        iv[~mask] = 0.0
+        if self.is_v2:
+            # v2 params: (N, 6) = [kappa, theta, sigma_v, rho, v0, r]
+            heston = params[:, :5]
+            r_arr  = params[:, 5:6]
+            heston_norm = (heston - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+            r_norm = ((r_arr - self.market_lo[0])
+                      / (self.market_hi[0] - self.market_lo[0] + 1e-12)).astype(np.float32)
+            q_norm = np.zeros_like(r_norm, dtype=np.float32)  # q fixed at 0 in v2
+            all_params = np.concatenate([heston_norm, r_norm, q_norm], axis=1)  # (N, 7)
+            # qm <= 1 marks pricer-success cells; ~0.7% of those still have
+            # NaN IV when Newton-Raphson inversion fails on a valid price,
+            # so we additionally require np.isfinite(iv) before training.
+            mask = (qm <= V2_QM_GOOD_MAX)  # type: ignore
+            del qm
+            mask &= np.isfinite(iv)
+            iv[~mask] = 0.0
+        else:
+            params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+            # r and q normalised independently to [0, 1] using per-bound ranges
+            r_norm = ((rq[:, 0:1] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)).astype(np.float32)
+            q_norm = ((rq[:, 1:2] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)).astype(np.float32)
+            all_params = np.concatenate([params, r_norm, q_norm], axis=1)  # (N, 7)
+            iv[~mask] = 0.0
 
         self.params_tensor = torch.from_numpy(all_params)
         self.iv_tensor = torch.from_numpy(iv.reshape(len(self.idx), -1))
@@ -918,25 +1013,42 @@ class BatesDataset(torch.utils.data.Dataset):
         self._open()
         j = int(self.idx[i])
 
-        params = self._h5["params"][j].astype(np.float32)        # type: ignore  (5,)
-        rq     = self._h5["market_params"][j].astype(np.float32) # type: ignore  (2,) r, q
-        iv     = self._h5["iv_surface"][j].astype(np.float32)    # type: ignore  (NK, NT)
-        mask   = self._h5["cell_mask"][j]                         # type: ignore  (NK, NT) bool
+        if self.is_v2:
+            params = self._h5["params"][j].astype(np.float32)         # type: ignore  (6,)
+            iv     = self._h5["iv_surface"][j].astype(np.float32)     # type: ignore  (NK, NT)
+            qm     = self._h5["quality_mask"][j]                       # type: ignore  (NK, NT) uint8
+            mask   = (qm <= V2_QM_GOOD_MAX) & np.isfinite(iv)
+            heston = params[:5]
+            r_val  = float(params[5])
+            heston_norm = (heston - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+            r_norm = np.array(
+                [(r_val - self.market_lo[0])
+                 / (self.market_hi[0] - self.market_lo[0] + 1e-12)],
+                dtype=np.float32,
+            )
+            q_norm = np.zeros(1, dtype=np.float32)  # q fixed at 0 in v2
+            all_params = np.concatenate([heston_norm, r_norm, q_norm])  # (7,)
+            iv = np.where(mask, iv, 0.0).astype(np.float32)
+        else:
+            params = self._h5["params"][j].astype(np.float32)        # type: ignore  (5,)
+            rq     = self._h5["market_params"][j].astype(np.float32) # type: ignore  (2,) r, q
+            iv     = self._h5["iv_surface"][j].astype(np.float32)    # type: ignore  (NK, NT)
+            mask   = self._h5["cell_mask"][j]                         # type: ignore  (NK, NT) bool
 
-        # Normalise Heston params + r, q independently → 7-element input vector
-        params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
-        r_norm = np.array(
-            [(rq[0] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)],
-            dtype=np.float32,
-        )
-        q_norm = np.array(
-            [(rq[1] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)],
-            dtype=np.float32,
-        )
-        all_params = np.concatenate([params, r_norm, q_norm])  # (7,)
+            # Normalise Heston params + r, q independently → 7-element input vector
+            params = (params - self.param_lo) / (self.param_hi - self.param_lo + 1e-12)
+            r_norm = np.array(
+                [(rq[0] - self.market_lo[0]) / (self.market_hi[0] - self.market_lo[0] + 1e-12)],
+                dtype=np.float32,
+            )
+            q_norm = np.array(
+                [(rq[1] - self.market_lo[1]) / (self.market_hi[1] - self.market_lo[1] + 1e-12)],
+                dtype=np.float32,
+            )
+            all_params = np.concatenate([params, r_norm, q_norm])  # (7,)
 
-        # Replace NaN with 0 in iv (loss will mask these out anyway)
-        iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]
+            # Replace NaN with 0 in iv (loss will mask these out anyway)
+            iv[~mask] = 0.0 # pyright: ignore[reportIndexIssue, reportOperatorIssue]
 
         if self.return_confidence:
             # Confidence proxy: raw quotes get 1.0, filled-only cells get 0.3

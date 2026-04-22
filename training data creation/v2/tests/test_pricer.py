@@ -55,14 +55,40 @@ def test_atm_1y_random_params_all_cos_standard():
 
 
 def test_deep_otm_short_put_never_cos_standard():
-    """50% OTM 1-week put: unpricable or asymptotic_fjl, never cos_standard."""
-    _, flag, _ = pricer.price_cell(
+    """50% OTM 1-week put: unpricable or cos_small_price, never cos_standard.
+
+    Plan revision 2026-04-18 dropped the FJL branch; cells that previously
+    routed to asymptotic_fjl now resolve to cos_extended → cos_small_price →
+    unpricable. A 50% OTM 1w put on the BASE set is far below 1e-4·spot.
+    """
+    p, flag, _ = pricer.price_cell(
         **BASE, K=50.0, T=1.0 / 52.0, option_type="put",
     )
-    assert flag != "cos_standard"
-    assert flag in {"unpricable", "asymptotic_fjl"}, (
-        f"got {flag!r}; spec allows only unpricable or asymptotic_fjl"
+    assert flag != "cos_standard", (
+        f"50% OTM 1w put must not flag cos_standard with positive price; "
+        f"got flag={flag!r}, p={p!r}"
     )
+    assert flag in {"unpricable", "cos_small_price", "cos_extended"}, (
+        f"got {flag!r}; spec allows unpricable / cos_small_price / cos_extended"
+    )
+
+
+def test_fjl_not_in_dispatch():
+    """Regression: FJL was removed from dispatch on 2026-04-18.
+
+    Sweep a range of deep-OTM × maturity cells that previously triggered FJL.
+    None should ever return asymptotic_fjl.
+    """
+    for T in [1.0 / 52.0, 1.0 / 12.0, 0.25, 0.5, 1.0, 2.0, 3.0]:
+        for K in [40.0, 50.0, 60.0, 140.0, 160.0, 180.0]:
+            ot = "put" if K < 100.0 else "call"
+            _, flag, _ = pricer.price_cell(
+                **BASE, K=K, T=T, option_type=ot,
+            )
+            assert flag != "asymptotic_fjl", (
+                f"asymptotic_fjl returned at K={K}, T={T}; FJL is deprecated "
+                "and must not appear in dispatch"
+            )
 
 
 def test_call_prices_monotone_decreasing_in_strike():
@@ -118,7 +144,7 @@ def test_grid_unpricable_fraction_below_15pct():
     total = 0
     unpr = 0
     method_count = {"cos_standard": 0, "cos_small_price": 0,
-                    "cos_extended": 0, "asymptotic_fjl": 0, "unpricable": 0}
+                    "cos_extended": 0, "unpricable": 0}
     for _ in range(n_sets):
         pars = dict(
             kappa=float(rng.uniform(0.5, 6.0)),

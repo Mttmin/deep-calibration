@@ -156,8 +156,12 @@ class GridFactorizedHead(nn.Module):
         self.nt = nt
         self.rank = rank
 
+        # Dropout intentionally omitted: shared-z dropout before bilinear einsum
+        # (a·b) breaks train/eval expectation symmetry — inverted-dropout's
+        # 1/(1-p) scaling preserves linear means but not bilinear products,
+        # so train-mode loss stays low while eval-mode RMSE blows up. Trunk +
+        # residual_head dropout already regularise upstream features.
         self.norm = nn.LayerNorm(width)
-        self.dropout = nn.Dropout(dropout)
 
         self.k_factors = nn.Linear(width, nk * rank)
         self.t_factors = nn.Linear(width, nt * rank)
@@ -167,7 +171,7 @@ class GridFactorizedHead(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         bsz = h.shape[0]
-        z = self.dropout(self.norm(h))
+        z = self.norm(h)
 
         a = self.k_factors(z).view(bsz, self.nk, self.rank)
         b = self.t_factors(z).view(bsz, self.nt, self.rank)
@@ -218,6 +222,7 @@ class BatesSurrogate(nn.Module):
         nt: int = 14,
         rank: int = 24,
         dropout: float = 0.10,
+        pricable_region: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.n_params  = n_params
@@ -233,12 +238,33 @@ class BatesSurrogate(nn.Module):
                 f"Expected nk*nt == n_outputs, got {self.nk}*{self.nt} != {self.n_outputs}"
             )
 
-        # Stem: project input to hidden width
+        # Pricable-region mask (NK*NT,) bool. Used by forward_with_mask and by
+        # downstream evaluation to restrict losses/metrics to cells where the
+        # COS pricer reliably produced a finite price across the realistic
+        # prior. None = treat all cells as pricable (back-compat).
+        if pricable_region is None:
+            pricable_buf = torch.ones(self.n_outputs, dtype=torch.bool)
+        else:
+            pricable_buf = pricable_region.detach().to(torch.bool).reshape(-1)
+            if pricable_buf.numel() != self.n_outputs:
+                raise ValueError(
+                    f"pricable_region must have {self.n_outputs} cells, "
+                    f"got {pricable_buf.numel()}"
+                )
+        self.register_buffer("pricable_region", pricable_buf, persistent=True)
+
+        # Stem: project input to hidden width.
+        # No dropout here: stem output feeds ResBlock chain whose first op is
+        # LayerNorm. Dropout-then-LayerNorm-downstream breaks train/eval
+        # invariance because LN re-normalises stats over a partly-zeroed
+        # activation, so eval-mode (no zeros) produces a different distribution
+        # than the network was trained on. Regularisation kept in residual_head
+        # and param_head (both place Dropout immediately before a Linear, no
+        # downstream LN).
         self.stem = nn.Sequential(
             nn.Linear(n_params, width * 2),
             nn.LayerNorm(width * 2),
             SwiGLU(),
-            nn.Dropout(dropout),
         )
         
         # Body: residual blocks
@@ -330,6 +356,17 @@ class BatesSurrogate(nn.Module):
         param_pred = self.param_head(x)
         return iv_pred, param_pred
 
+    def forward_with_mask(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning the IV surface and the pricable-cell mask.
+
+        The mask is broadcast to (B, n_outputs) so callers can apply it
+        directly in masked losses / metrics without re-reshaping.
+        """
+        iv_pred = self.forward(theta)
+        mask = self.pricable_region.to(dtype=torch.bool, device=iv_pred.device)
+        mask = mask.unsqueeze(0).expand(iv_pred.shape[0], -1)
+        return iv_pred, mask
+
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -357,6 +394,7 @@ class BatesSurrogate(nn.Module):
             "residual_head.1.",
             "residual_head.3.",
             "param_head.",  # New dual-head; old checkpoints won't have it
+            "pricable_region",  # Buffer added with v2 pipeline support
         )
         bad_missing = [k for k in missing if not k.startswith(allowed_missing_prefixes)]
         bad_unexpected = [k for k in unexpected if not k.startswith("head.")]
@@ -371,6 +409,10 @@ class BatesSurrogate(nn.Module):
         """Reconstructs model from a training checkpoint dict."""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         cfg  = ckpt["config"]
+        # Honour saved pricable_region if present in the state dict; otherwise
+        # construct with the all-True default so the buffer slot exists.
+        sd = ckpt["model_state_dict"]
+        pricable_region = sd.get("pricable_region", None)
         model = cls(
             n_params  = cfg.get("n_params",  5),
             n_outputs = cfg.get("n_outputs", 686),
@@ -380,8 +422,9 @@ class BatesSurrogate(nn.Module):
             nt        = cfg.get("nt",        14),
             rank      = cfg.get("rank",      24),
             dropout   = cfg.get("dropout",   0.10),
+            pricable_region = pricable_region,
         )
-        model.load_compatible_state_dict(ckpt["model_state_dict"])
+        model.load_compatible_state_dict(sd)
         return model
 
 

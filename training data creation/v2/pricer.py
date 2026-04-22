@@ -1,26 +1,34 @@
 """
-Phase 1: Multi-method Heston pricer (COS + FJL asymptotic fallback).
-====================================================================
+Phase 1: Multi-method Heston pricer (COS standard + extended fallback).
+=======================================================================
 
 Dispatches each (param, K, T) cell across:
 
-  1. COS with HALF_ABS=5.0, N_COS=512 in float64  (method: cos_standard)
-  2. COS with HALF_ABS=10.0, N_COS=2048            (method: cos_extended)
-  3. Forde-Jacquier-Lee small-time asymptotic      (method: asymptotic_fjl)
-                                                   only when |log(K/S)| > 0.3
-  4. Unpricable marker (below precision)           (method: unpricable)
+  1. COS with adaptive half_abs (L=10), N_COS=512   (method: cos_standard)
+  2. COS with adaptive half_abs (L=15), N_COS=2048  (method: cos_extended)
+     Invoked when cos_standard returns NaN or price/spot < 1e-4.
+  3. cos_small_price flag if cos_extended yields price in [1e-6, 1e-4) of spot.
+  4. Unpricable marker (below 1e-6 precision)       (method: unpricable)
 
-Per SCENARIO_PLAN.md Phase 1A. Characteristic function (Little Trap form,
-Albrecher et al. 2007) and call-payoff COS coefficients match the legacy
+Adaptive truncation (Phase 2A-v2 fix, 2026-04-18) sizes the COS window per
+cell as max(0.5, |c1+x_l| + L*sqrt(c2)) using the simplified Heston
+cumulants. Puts use direct payoff coefficients (not put-call parity) to
+avoid catastrophic cancellation when the twin call is deep ITM.
+
+Per SCENARIO_PLAN.md Phase 1A + updated plan 2026-04-18 (FJL dropped).
+
+Characteristic function (Little Trap form, Albrecher et al. 2007) and
+call-payoff COS coefficients match the legacy
 `training data creation/heston_datagen.py` pricer for bitwise continuity
 of cells that both pricers can handle.
 
-FJL small-time asymptotic: Forde & Jacquier (2009) Theorem 2.4, with
-the ATM expansion of Theorem 2.5 used as a |x|→0 Taylor fallback.
-Rate-function formulas derived directly from the pole structure of
-Lambda(p) in Section 1.2 of v2/docs/asymptotic_methods.md (the doc's
-bounds table has a factor-4 typo; we use u* = atan2(bar_rho, rho)
-which is the correct pole of Lambda).
+The Forde-Jacquier-Lee small-time asymptotic was previously dispatched in
+this module but Phase 2A MC validation (2026-04-18) showed leading-order
+FJL is structurally inadequate at the maturities present in the training
+grid (mean |rel err| 8908% on FJL-flagged cells). The FJL implementation
+is retained below in a DEPRECATED block for reference but is not in the
+dispatch path. Cells that previously routed to FJL now route to
+cos_extended → cos_small_price → unpricable.
 
 All math in pure numpy / math; intentionally scalar to keep the
 dispatcher simple and debuggable. Batched/vectorised variants can be
@@ -34,13 +42,47 @@ from typing import Literal, Tuple
 
 import numpy as np
 
-HALF_ABS_STD: float = 5.0
 N_COS_STD: int = 512
-HALF_ABS_EXT: float = 10.0
 N_COS_EXT: int = 2048
-DEEP_OTM_THRESHOLD: float = 0.3
 RATIO_ACCEPT: float = 1e-4
 RATIO_PRECISION: float = 1e-6
+# Adaptive truncation: half_abs = max(HALF_FLOOR, |c1+x_l| + L_FACTOR*sqrt(c2)).
+# Phase 2A-v2 (2026-04-18) showed static HALF_ABS=5 under-resolved short-T cells
+# (node spacing >= density sigma). Adaptive scales window with Heston cumulants.
+L_FACTOR: float = 10.0
+HALF_FLOOR: float = 0.5
+L_FACTOR_EXT: float = 15.0  # wider margin on extended tier
+
+
+# -------------------- Heston cumulants (simplified) --------------------
+
+def _heston_cumulants_simplified(
+    T: float, kappa: float, theta: float, v0: float, r: float, q: float,
+) -> Tuple[float, float]:
+    """Return (c1, c2) for log(S_T/S_0). c2 uses integrated variance only.
+
+    Exact c1. For c2 we use integ_var = E[int_0^T v_s ds] = theta*T +
+    (v0-theta)*(1-e^(-kT))/k, which is a lower bound on Var(log S_T) but
+    dominates at short-to-moderate T. The missing sigma_v^2 and rho*sigma_v
+    contributions are absorbed by the L_FACTOR=10 margin in
+    `_adaptive_half_abs`.
+    """
+    if kappa * T < 1e-10:
+        em1 = kappa * T
+    else:
+        em1 = 1.0 - math.exp(-kappa * T)
+    integ_var = theta * T + (v0 - theta) * em1 / kappa
+    c1 = (r - q) * T - 0.5 * integ_var
+    return c1, integ_var
+
+
+def _adaptive_half_abs(
+    T: float, kappa: float, theta: float, v0: float,
+    r: float, q: float, x_l: float, L_factor: float,
+) -> float:
+    """Adaptive COS truncation half-width covering |c1+x_l| + L*sqrt(c2)."""
+    c1, c2 = _heston_cumulants_simplified(T, kappa, theta, v0, r, q)
+    return max(HALF_FLOOR, abs(c1 + x_l) + L_factor * math.sqrt(max(c2, 0.0)))
 
 
 # -------------------- Heston CF (Little Trap) --------------------
@@ -70,33 +112,51 @@ def _heston_cf(
 
 # -------------------- COS pricer (scalar) --------------------
 
-def _cos_call_price_scalar(
+def _cos_price_scalar(
     kappa: float, theta: float, sigma: float, rho: float, v0: float,
     r: float, q: float, K: float, T: float, spot: float,
-    half_abs: float, n_cos: int,
+    half_abs: float, n_cos: int, option_type: str,
 ) -> float:
-    """Fang-Oosterlee COS call price, single (K, T). Returns float64.
+    """Fang-Oosterlee COS price, single (K, T), direct coeffs for both sides.
 
-    Returns NaN if the CF evaluation or aggregation produces non-finite
-    values; returns a possibly-tiny but finite number otherwise (caller
-    decides whether it is above precision).
+    Call integrates max(e^y - 1, 0) over y in [0, b]; put integrates
+    max(1 - e^y, 0) over y in [a, 0]. Using the side-of-money payoff avoids
+    the catastrophic cancellation that put-via-call-parity exhibits when
+    the call is deep ITM (Phase 2A-v2 BLOCKER, 2026-04-18).
+
+    Returns NaN if CF evaluation or aggregation produces non-finite values.
     """
     a, b = -half_abs, half_abs
     ba = b - a
     k_idx = np.arange(n_cos, dtype=np.float64)
     u_k = k_idx * math.pi / ba
-    ang0 = -u_k * a
-    cos0 = np.cos(ang0)
-    sin0 = np.sin(ang0)
-    cos_kpi = np.cos(k_idx * math.pi)
+    cos_ub = np.cos(u_k * b)
+    sin_ub = np.sin(u_k * b)
+    cos_kpi = np.cos(k_idx * math.pi)  # (-1)^k
     denom = 1.0 + u_k * u_k
     denom[0] = 1.0
-    chi = (math.exp(b) * cos_kpi - cos0 - u_k * sin0) / denom
-    chi[0] = math.exp(b) - 1.0
-    psi = np.zeros(n_cos, dtype=np.float64)
-    psi[0] = b
-    psi[1:] = -sin0[1:] / u_k[1:]
-    Vk = (2.0 / ba) * (chi - psi)
+
+    if option_type == "call":
+        # chi_k = int_0^b e^y cos(k*pi*(y-a)/(b-a)) dy
+        # psi_k = int_0^b cos(k*pi*(y-a)/(b-a)) dy
+        chi = (math.exp(b) * cos_kpi - cos_ub - u_k * sin_ub) / denom
+        chi[0] = math.exp(b) - 1.0
+        psi = np.zeros(n_cos, dtype=np.float64)
+        psi[0] = b
+        psi[1:] = -sin_ub[1:] / u_k[1:]
+        Vk = (2.0 / ba) * (chi - psi)
+    else:  # put
+        exp_a = math.exp(a)
+        # chi_k = int_a^0 e^y cos(k*pi*(y-a)/(b-a)) dy
+        # psi_k = int_a^0 cos(k*pi*(y-a)/(b-a)) dy
+        # Upper bound y=0 gives cos(u_k*(-a))=cos(u_k*b); lower bound
+        # y=a gives cos(0)=1 (no (-1)^k factor — contrast with call case).
+        chi = (cos_ub + u_k * sin_ub - exp_a) / denom
+        chi[0] = 1.0 - exp_a
+        psi = np.zeros(n_cos, dtype=np.float64)
+        psi[0] = -a
+        psi[1:] = sin_ub[1:] / u_k[1:]
+        Vk = (2.0 / ba) * (psi - chi)
     Vk[0] *= 0.5
 
     phi = _heston_cf(u_k, T, kappa, theta, sigma, rho, v0, r, q)
@@ -107,28 +167,88 @@ def _cos_call_price_scalar(
     s = float(np.sum(integrand * Vk))
     if not math.isfinite(s):
         return float("nan")
-    return math.exp(-r * T) * K * s
+    price = math.exp(-r * T) * K * s
+    return max(price, 0.0)
 
 
 def _cos_price(
     kappa: float, theta: float, sigma: float, rho: float, v0: float,
     r: float, q: float, K: float, T: float, spot: float,
-    option_type: str, half_abs: float, n_cos: int,
+    option_type: str, n_cos: int, L_factor: float,
 ) -> float:
-    """COS price for call or put. Put via put-call parity."""
-    call = _cos_call_price_scalar(
-        kappa, theta, sigma, rho, v0, r, q, K, T, spot, half_abs, n_cos
+    """COS price with adaptive truncation sized from Heston cumulants."""
+    x_l = math.log(spot / K)
+    half_abs = _adaptive_half_abs(T, kappa, theta, v0, r, q, x_l, L_factor)
+    return _cos_price_scalar(
+        kappa, theta, sigma, rho, v0, r, q, K, T, spot,
+        half_abs, n_cos, option_type,
     )
-    if not math.isfinite(call):
-        return float("nan")
-    call = max(call, 0.0)
-    if option_type == "call":
-        return call
-    put = call + K * math.exp(-r * T) - spot * math.exp(-q * T)
-    return max(put, 0.0)
 
 
-# -------------------- FJL small-time asymptotic --------------------
+# -------------------- Main dispatcher --------------------
+
+def price_cell(
+    kappa: float, theta: float, sigma: float, rho: float, v0: float,
+    r: float, q: float, K: float, T: float, spot: float,
+    option_type: Literal["call", "put"] = "call",
+) -> Tuple[float, str, float]:
+    """Multi-method price for a single (param, K, T) cell.
+
+    Returns (price, method_flag, confidence) per SCENARIO_PLAN.md Phase 1A
+    as revised on 2026-04-18 (FJL dropped from dispatch).
+
+    Dispatch:
+      1. cos_standard  (HALF_ABS=5,  N=512). Accept if price/spot > 1e-4.
+      2. cos_extended  (HALF_ABS=10, N=2048). Invoked when cos_standard
+         is NaN OR returns price/spot < 1e-4. Accept if price/spot > 1e-4.
+      3. cos_small_price flag if best COS attempt yields price in
+         [1e-6, 1e-4) of spot. Bulk accuracy not guaranteed; downstream
+         training masks these cells.
+      4. unpricable if all methods fail or yield price < 1e-6 of spot.
+
+    method_flag ∈ {cos_standard, cos_extended, cos_small_price, unpricable}
+    """
+    # Step 1: standard COS (adaptive half_abs, N=512).
+    p_std = _cos_price(kappa, theta, sigma, rho, v0, r, q,
+                       K, T, spot, option_type,
+                       N_COS_STD, L_FACTOR)
+    if math.isfinite(p_std) and (p_std / spot) > RATIO_ACCEPT:
+        return p_std, "cos_standard", 1.0
+
+    # Step 2: extended COS — wider window + N=2048; fires on NaN or small p_std.
+    p_ext = _cos_price(kappa, theta, sigma, rho, v0, r, q,
+                       K, T, spot, option_type,
+                       N_COS_EXT, L_FACTOR_EXT)
+    if math.isfinite(p_ext) and (p_ext / spot) > RATIO_ACCEPT:
+        return p_ext, "cos_extended", 1.0
+
+    # Step 3: small-price flag if either COS produced a finite price in
+    # [1e-6, 1e-4) of spot. Prefer the extended result when available.
+    candidate = p_ext if math.isfinite(p_ext) else p_std
+    if math.isfinite(candidate) and (candidate / spot) > RATIO_PRECISION:
+        return candidate, "cos_small_price", 0.7
+
+    # Step 4: below precision — unpricable.
+    return float("nan"), "unpricable", 0.0
+
+
+# ===========================================================================
+# DEPRECATED — kept for reference, not in dispatch.
+# ===========================================================================
+#
+# Forde-Jacquier-Lee small-time asymptotic. Removed from `price_cell`
+# dispatch on 2026-04-18 after Phase 2A MC validation showed leading-order
+# FJL is structurally inadequate at the training-grid maturities (T up to
+# 3y), with mean |rel err| 8908% on FJL-flagged cells (BLOCKER report:
+# docs/BLOCKER_phase2a_mc_validation.md). The next-to-leading correction
+# is O(sqrt(T)); a higher-order implementation would be needed to make FJL
+# usable as a wing fallback even on the short end of the grid. Until that
+# work is done the dispatcher routes deep-OTM cells to cos_extended →
+# cos_small_price → unpricable instead. A future researcher revisiting
+# wing accuracy may want to start here: the helper functions below
+# (_fjl_Lambda, _fjl_Lambda_prime, _fjl_find_pstar, _fjl_iv, _fjl_price)
+# implement Forde-Jacquier 2009 Theorem 2.4 + 2.5 (ATM expansion), with
+# rate-function pole bounds derived in docs/asymptotic_methods.md §1.2.
 
 def _fjl_pole_bounds(sigma: float, rho: float) -> Tuple[float, float]:
     """Lambda(p) pole boundaries (p_-, p_+).
@@ -258,53 +378,3 @@ def _fjl_price(
     if not math.isfinite(sigma_bs) or sigma_bs <= 0.0:
         return float("nan")
     return _bs_price(spot, K, T, r, q, sigma_bs, option_type)
-
-
-# -------------------- Main dispatcher --------------------
-
-def price_cell(
-    kappa: float, theta: float, sigma: float, rho: float, v0: float,
-    r: float, q: float, K: float, T: float, spot: float,
-    option_type: Literal["call", "put"] = "call",
-) -> Tuple[float, str, float]:
-    """Multi-method price for a single (param, K, T) cell.
-
-    Returns (price, method_flag, confidence) per SCENARIO_PLAN.md Phase 1A.
-
-    method_flag ∈ {cos_standard, cos_small_price, cos_extended,
-                   asymptotic_fjl, unpricable}
-    """
-    x = math.log(K / spot)
-
-    # Step 1-3: standard COS.
-    p_std = _cos_price(kappa, theta, sigma, rho, v0, r, q,
-                       K, T, spot, option_type,
-                       HALF_ABS_STD, N_COS_STD)
-    if math.isfinite(p_std):
-        ratio = p_std / spot
-        if ratio > RATIO_ACCEPT:
-            return p_std, "cos_standard", 1.0
-        if ratio > RATIO_PRECISION:
-            return p_std, "cos_small_price", 0.7
-        # Finite but below 1e-6 precision. Fall through to FJL (step 5).
-    else:
-        # Step 4: extended COS (only fires on NaN/inf from standard).
-        p_ext = _cos_price(kappa, theta, sigma, rho, v0, r, q,
-                           K, T, spot, option_type,
-                           HALF_ABS_EXT, N_COS_EXT)
-        if math.isfinite(p_ext):
-            ratio = p_ext / spot
-            if ratio > RATIO_ACCEPT:
-                return p_ext, "cos_extended", 1.0
-            if ratio > RATIO_PRECISION:
-                return p_ext, "cos_extended", 0.7
-
-    # Step 5: FJL asymptotic, deep-OTM only.
-    if abs(x) > DEEP_OTM_THRESHOLD:
-        p_fjl = _fjl_price(kappa, theta, sigma, rho, v0, r, q,
-                           K, T, spot, option_type)
-        if math.isfinite(p_fjl) and p_fjl > 0.0 and (p_fjl / spot) > RATIO_PRECISION:
-            return p_fjl, "asymptotic_fjl", 0.5
-
-    # Step 6: no method produced a price above precision.
-    return float("nan"), "unpricable", 0.0

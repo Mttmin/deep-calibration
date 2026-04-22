@@ -543,7 +543,14 @@ def validate(
     sums    = dict(total=0.0, vega=0.0, calendar=0.0, butterfly=0.0, term_structure=0.0)
     sq_err_sum = 0.0
     valid_sum  = 0.0
+    sq_err_pricable_sum = 0.0
+    valid_pricable_sum  = 0.0
+    coverage_sum  = 0.0
+    coverage_n    = 0
     steps      = 0
+
+    pricable = model.pricable_region.to(device=device, dtype=torch.bool).view(1, -1)
+    n_pricable = int(pricable.sum().item())
 
     for batch in loader:
         params_norm = batch[0].to(device, non_blocking=True)
@@ -583,13 +590,29 @@ def validate(
         sums["term_structure"] += bd.term_structure.item()
 
         m  = mask_flat.float()
-        sq_err_sum += ((iv_pred.float() - iv_flat) ** 2 * m).sum().item()
+        sqe = (iv_pred.float() - iv_flat) ** 2
+        sq_err_sum += (sqe * m).sum().item()
         valid_sum  += m.sum().item()
+
+        # Pricable-region restricted metrics: intersect the per-surface
+        # training mask with the (broadcast) pricable_region mask.
+        m_pricable = (mask_flat & pricable).float()
+        sq_err_pricable_sum += (sqe * m_pricable).sum().item()
+        valid_pricable_sum  += m_pricable.sum().item()
+        if n_pricable > 0:
+            # per-surface coverage: |valid ∩ pricable| / |pricable|
+            cov_per_surface = m_pricable.sum(dim=1) / float(n_pricable)
+            coverage_sum += cov_per_surface.sum().item()
+            coverage_n   += int(cov_per_surface.numel())
         steps += 1
 
     metrics = {k: v / max(steps, 1) for k, v in sums.items()}
     mse     = sq_err_sum / max(valid_sum, 1.0)
-    metrics["ivrmse_bps"] = math.sqrt(mse) * 10_000.0
+    metrics["ivrmse_bps"]          = math.sqrt(mse) * 10_000.0
+    metrics["ivrmse_full_bps"]     = math.sqrt(mse) * 10_000.0
+    mse_p = sq_err_pricable_sum / max(valid_pricable_sum, 1.0)
+    metrics["ivrmse_pricable_bps"] = math.sqrt(mse_p) * 10_000.0
+    metrics["coverage"]            = coverage_sum / max(coverage_n, 1)
     return metrics
 
 
@@ -884,6 +907,26 @@ def main() -> None:
         _run_pinn_finetune(args, device, grid, train_loader, val_loader)
         return
 
+    # Pull the pricable_region from the training dataset (v2 only) and bake
+    # it into the model as a buffer. v1 datasets fall through with None,
+    # giving an all-True buffer so legacy training is unchanged.
+    def _unwrap_pricable(loader: DataLoader) -> torch.Tensor | None:
+        d = loader.dataset
+        while hasattr(d, "dataset") and not hasattr(d, "pricable_region"):
+            d = d.dataset  # type: ignore[assignment]
+        pr = getattr(d, "pricable_region", None)
+        if pr is None:
+            return None
+        return torch.as_tensor(np.asarray(pr, dtype=bool)).reshape(-1)
+
+    pricable_region_tensor = _unwrap_pricable(train_loader)
+    if pricable_region_tensor is not None:
+        print(
+            f"[model] pricable_region: "
+            f"{int(pricable_region_tensor.sum())}/{pricable_region_tensor.numel()} cells "
+            f"({pricable_region_tensor.float().mean()*100:.1f}%)"
+        )
+
     # Model
     model_config = dict(
         n_params  = 7,   # 5 Heston params + r + q (each independently normalised)
@@ -895,7 +938,7 @@ def main() -> None:
         rank      = args.rank,
         dropout   = args.dropout,
     )
-    model = BatesSurrogate(**model_config).to(device)
+    model = BatesSurrogate(**model_config, pricable_region=pricable_region_tensor).to(device)
     print(f"[model] {model.n_parameters():,} parameters")
 
     optimizer = torch.optim.Adam(
@@ -935,6 +978,7 @@ def main() -> None:
         "train_batch_wait_ms", "train_h2d_ms", "train_compute_ms",
         "val_total", "val_vega", "val_cal", "val_bfly", "val_ts",
         "val_ivrmse_bps",
+        "val_ivrmse_full_bps", "val_ivrmse_pricable_bps", "val_coverage",
     ]
     write_header = not log_path.exists()
     log_fh = open(log_path, "a", newline="")
@@ -1013,6 +1057,8 @@ def main() -> None:
             f"val_vega={val_m['vega']:.6f}  "
             f"val_total={val_m['total']:.6f}  "
             f"val_ivrmse={ivrmse:.2f} bps  "
+            f"val_ivrmse_pricable={val_m['ivrmse_pricable_bps']:.2f} bps  "
+            f"cov={val_m['coverage']*100:.1f}%  "
             # f"wait={train_m['batch_wait_ms']:.1f}ms  "
             # f"h2d={train_m['h2d_ms']:.1f}ms  "
             # f"compute={train_m['compute_ms']:.1f}ms  "
@@ -1037,6 +1083,9 @@ def main() -> None:
             "val_bfly":       val_m["butterfly"],
             "val_ts":         val_m["term_structure"],
             "val_ivrmse_bps": ivrmse,
+            "val_ivrmse_full_bps":     val_m.get("ivrmse_full_bps",     ivrmse),
+            "val_ivrmse_pricable_bps": val_m.get("ivrmse_pricable_bps", float("nan")),
+            "val_coverage":            val_m.get("coverage",            float("nan")),
         }
         writer.writerow(row)
         log_fh.flush()

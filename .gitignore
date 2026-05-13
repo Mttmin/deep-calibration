@@ -59,4 +59,8 @@ runs/
 logs/
 
 # model is too large to go on GitHub
-model/bates_surrogate.onnx
+model/bates_surrogate.onnx# ONNX exports (regenerate from calibration pipeline)
+model/*.onnx
+model/*.onnx.data
+*.onnx
+*.onnx.data

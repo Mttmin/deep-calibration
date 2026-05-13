@@ -57,3 +57,6 @@ api_keys.json
 model/runs/
 runs/
 logs/
+
+# model is too large to go on GitHub
+model/bates_surrogate.onnx

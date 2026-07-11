@@ -236,8 +236,9 @@ def calendar_spread_penalty(
     n_valid    = pair_valid.sum().clamp(min=1.0)
     adj_penalty = (violations * pair_valid).sum() / n_valid
 
-    # Long-range calendar check at key index pairs (1W→1M, 1M→6M, 6M→2Y).
-    # These correspond to high41x14 grid indices (0,3), (3,7), (7,11).
+    # Long-range calendar check at key index pairs (1W→1M, 1M→6M, 6M→1.5Y).
+    # These correspond to high41x14 grid indices (0,3), (3,7), (7,11)
+    # (maturity index 11 is 1.5y; 2.0y is index 12).
     # Prevents the network from fitting adjacent differences while violating
     # larger-scale total-variance monotonicity.
     lr_pairs = [(0, 3), (3, 7), (7, 11)]

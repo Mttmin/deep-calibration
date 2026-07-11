@@ -113,6 +113,13 @@ def main() -> None:
     ap.add_argument("--grid", type=str, default="high41x14", choices=["base25x10", "high41x14"])
     ap.add_argument("--use-raw-mask", action="store_true", help="Score only on raw invertible cells")
     ap.add_argument("--use-confidence", action="store_true", help="Multiply weights by cell_confidence if present")
+    ap.add_argument("--rq-pairs", type=int, default=3,
+                    help="Number of (r, q) pairs scored per surface. The real-surface "
+                         "HDF5 does not store market rates, so (r, q) must be searched: "
+                         "with a single random pair, rate misspecification is absorbed "
+                         "into the calibrated (theta, v0, rho) candidates. Scoring the "
+                         "same candidates under several pairs and pooling the top-K "
+                         "lets the fit select the carry instead. Costs rq-pairs x pricing.")
     args = ap.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -186,32 +193,45 @@ def main() -> None:
             seed=args.seed + 17 * int(j),
         )
 
-        # Current pricer uses scalar r,q per batch; calibrate one market pair per surface.
+        # The pricer takes a scalar (r, q) per batch and the real-surface file
+        # stores no market rates, so score the same candidates under several
+        # (r, q) pairs and pool: the fit then selects the carry jointly with
+        # the Heston params instead of absorbing a single random draw's rate
+        # error into (theta, v0, rho).
         rng = np.random.default_rng(args.seed + 101 * int(j))
-        r_s = float(rng.uniform(*r_bounds)) # type: ignore
-        q_s = float(rng.uniform(*q_bounds)) # type: ignore
+        n_pairs = max(1, int(args.rq_pairs))
+        rmse_pool: list[np.ndarray] = []
+        market_pool: list[np.ndarray] = []
+        for _ in range(n_pairs):
+            r_s = float(rng.uniform(*r_bounds)) # type: ignore
+            q_s = float(rng.uniform(*q_bounds)) # type: ignore
 
-        pred = simulate_candidates(
-            mod=mod,
-            params_np=cand_params,
-            r=r_s,
-            q=q_s,
-            chunk_size=args.batch,
-            dev=dev,
-        )
+            pred = simulate_candidates(
+                mod=mod,
+                params_np=cand_params,
+                r=r_s,
+                q=q_s,
+                chunk_size=args.batch,
+                dev=dev,
+            )
 
-        diff = pred - target[None, :, :]
-        sq = diff * diff
-        mse = (sq * w[None, :, :]).sum(axis=(1, 2)) / w_sum
-        rmse = np.sqrt(mse)
+            diff = pred - target[None, :, :]
+            sq = diff * diff
+            mse = (sq * w[None, :, :]).sum(axis=(1, 2)) / w_sum
+            rmse_pool.append(np.sqrt(mse))
+            market_pool.append(np.full((len(cand_params), 2), [r_s, q_s], dtype=np.float64))
 
-        k = min(args.top_k, len(rmse))
-        best = np.argpartition(rmse, k - 1)[:k]
-        best = best[np.argsort(rmse[best])]
+        rmse_all = np.concatenate(rmse_pool)              # (n_pairs * C,)
+        market_all = np.concatenate(market_pool)          # (n_pairs * C, 2)
+        params_all = np.tile(cand_params, (n_pairs, 1))   # (n_pairs * C, D)
 
-        top_params_all.append(cand_params[best])
-        top_market_all.append(np.full((len(best), 2), [r_s, q_s], dtype=np.float64))
-        top_scores_all.append(rmse[best])
+        k = min(args.top_k, len(rmse_all))
+        best = np.argpartition(rmse_all, k - 1)[:k]
+        best = best[np.argsort(rmse_all[best])]
+
+        top_params_all.append(params_all[best])
+        top_market_all.append(market_all[best])
+        top_scores_all.append(rmse_all[best])
         src_idx_all.append(int(j))
 
         t = tickers[j]
@@ -234,6 +254,7 @@ def main() -> None:
         f.attrs["N_surfaces"] = len(top_params_all)
         f.attrs["top_k"] = int(args.top_k)
         f.attrs["candidates_per_surface"] = int(args.candidates)
+        f.attrs["rq_pairs_per_surface"] = int(args.rq_pairs)
 
         f.create_dataset("source_index", data=np.array(src_idx_all, dtype=np.int32))
         f.create_dataset("source_ticker", data=np.array(src_ticker, dtype=object), dtype=ticker_dtype)

@@ -304,7 +304,8 @@ def price_european_grid(
     meta = MCMeta(
         dt=dt,
         n_total=n_total,
-        mat_indices=mat_indices[inv_perm].copy() if False else mat_indices.copy(),
+        # Report step indices in the caller's T ordering (matching prices/se).
+        mat_indices=mat_indices[inv_perm].copy(),
         antithetic=antithetic,
         n_paths=n_paths,
         seed=actual_seed,

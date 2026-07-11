@@ -67,8 +67,26 @@ from model.loss import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training data creation"))
 from heston_datagen import BatesDataset, R_BOUNDS, Q_BOUNDS   # type: ignore[import]
 
+# Market-rate denormalisation bounds used to recover physical (r, q) from the
+# normalised slots 5/6 of params_norm (for vega-weight computation). These
+# default to the legacy v1 bounds but are OVERWRITTEN from the dataset's own
+# metadata in make_dataloaders(): v2 datasets normalise r with
+# V2_R_BOUNDS = (0, 0.05) and pin q = 0, so keeping the legacy (0, 0.06) /
+# (0, 0.04) here would inflate the denormalised r by 20% and mis-weight vegas.
 MARKET_R_LO, MARKET_R_HI = float(R_BOUNDS[0]), float(R_BOUNDS[1])
 MARKET_Q_LO, MARKET_Q_HI = float(Q_BOUNDS[0]), float(Q_BOUNDS[1])
+
+
+def _set_market_bounds_from_dataset(ds: BatesDataset) -> None:
+    """Sync the module-level (r, q) denormalisation bounds with the bounds the
+    dataset actually normalised with (ds.market_lo/market_hi cover [r, q])."""
+    global MARKET_R_LO, MARKET_R_HI, MARKET_Q_LO, MARKET_Q_HI
+    MARKET_R_LO, MARKET_R_HI = float(ds.market_lo[0]), float(ds.market_hi[0])
+    MARKET_Q_LO, MARKET_Q_HI = float(ds.market_lo[1]), float(ds.market_hi[1])
+    print(
+        f"[data] market bounds from dataset: r ∈ [{MARKET_R_LO}, {MARKET_R_HI}]  "
+        f"q ∈ [{MARKET_Q_LO}, {MARKET_Q_HI}]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +248,7 @@ def build_dataloaders(
 
     meta_ds = BatesDataset(h5_path, min_valid_cells=None, preload=False)
     N       = len(meta_ds)
+    _set_market_bounds_from_dataset(meta_ds)
 
     rng = np.random.default_rng(seed)
 

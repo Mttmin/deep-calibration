@@ -21,7 +21,7 @@ Quick start
   model = BatesSurrogate.from_checkpoint("model/runs/best.pt")
   result = calibrate_single(model, iv_market, mask_market, grid)
 """
-from .network import BatesSurrogate, GridConstants, ResBlock
+from .network import BatesSurrogate, GridConstants, LiveSurrogate, ResBlock, load_for_inference, strip_dead_gemms
 from .loss import (
     compute_vega_weights,
     vega_weighted_mse,
@@ -43,7 +43,8 @@ from .calibrate import (
 from .export import export_torchscript, export_onnx, load_and_export
 
 __all__ = [
-    "BatesSurrogate", "GridConstants", "ResBlock",
+    "BatesSurrogate", "GridConstants", "ResBlock", "LiveSurrogate",
+    "strip_dead_gemms", "load_for_inference",
     "compute_vega_weights", "vega_weighted_mse",
     "calendar_spread_penalty", "durrleman_butterfly_penalty",
     "total_loss", "ivrmse_bps", "LossBreakdown",

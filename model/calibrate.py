@@ -395,7 +395,8 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = BatesSurrogate.from_checkpoint(args.checkpoint).to(device).eval()
+    from model.network import load_for_inference
+    model = load_for_inference(args.checkpoint, compile=True, device=device)
     grid  = GridConstants.from_h5(args.h5).to(device)
 
     ds = BatesDataset(args.h5, min_valid_cells=0)

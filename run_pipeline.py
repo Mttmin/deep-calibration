@@ -33,7 +33,7 @@ DATAGEN_DIR = ROOT / "training data creation"
 DATA_DIR = ROOT / "data"
 MODEL_DIR = ROOT / "model"
 RUNS_DIR = MODEL_DIR / "runs"
-DIAG_DIR = ROOT / "diagnostics"
+V2_CKPT = ROOT / "runs" / "v2_baseline" / "best.pt"
 OPTIONS_PRICER_DIR = ROOT.parent / "options-pricer"
 
 DEFAULT_GUIDED_BANK = str(DATA_DIR / "guided_param_bank_halfyear_2026_04_08.h5")
@@ -138,12 +138,12 @@ def step_train(args: argparse.Namespace) -> None:
 
 
 def step_export(args: argparse.Namespace) -> None:
-    """Export trained checkpoint to ONNX."""
-    checkpoint = RUNS_DIR / "best.pt"
+    """Export the stripped inference graph to the ONNX path the pricer loads."""
+    checkpoint = Path(args.checkpoint)
     if not checkpoint.exists():
         print(f"[pipeline] ERROR: checkpoint not found: {checkpoint}")
         sys.exit(1)
-
+    print(f"[pipeline] export checkpoint: {checkpoint}")
     adapter = RUNS_DIR / "best_pinn_adapter.pt"
     cmd = [
         PY, "-m", "model.export",
@@ -151,7 +151,9 @@ def step_export(args: argparse.Namespace) -> None:
         "--out-dir", str(MODEL_DIR),
         "--format", "onnx",
     ]
-    if adapter.exists():
+    # The LoRA adapter was trained on model/runs/best.pt, not the v2 checkpoint.
+    # Fusing it onto a different base would change the IV surface the pricer sees.
+    if adapter.exists() and checkpoint.resolve() == (RUNS_DIR / "best.pt").resolve():
         cmd += ["--adapter", str(adapter)]
 
     run(cmd, cwd=ROOT, step_name="export → ONNX")
@@ -219,6 +221,13 @@ def main() -> None:
     ap.add_argument("--skip-export",     action="store_true", help="Skip ONNX export")
     ap.add_argument("--skip-accuracy",   action="store_true", help="Skip Python accuracy diagnostics")
     ap.add_argument("--skip-rust-tests", action="store_true", help="Skip Rust integration tests")
+    ap.add_argument(
+        "--checkpoint",
+        type=str,
+        default=str(V2_CKPT if V2_CKPT.exists() else RUNS_DIR / "best.pt"),
+        help="Checkpoint to export for the options pricer "
+             "(default: runs/v2_baseline/best.pt when present)",
+    )
     ap.add_argument("--accuracy-only",   action="store_true",
                     help="Run only accuracy tests (Python diag + Rust tests); skips datagen/train/export")
 

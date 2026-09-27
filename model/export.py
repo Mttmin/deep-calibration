@@ -37,7 +37,12 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from model.network import BatesSurrogate, BatesSurrogateWithPINN
+from model.network import (
+    BatesSurrogate,
+    BatesSurrogateWithPINN,
+    PINNAdapter,
+    strip_dead_gemms,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +146,7 @@ def export_onnx(
             },
             opset_version = opset_version,
             do_constant_folding = True,
+            external_data = False,
         )
 
     size_mb = output_path.stat().st_size / 1e6
@@ -183,6 +189,18 @@ def export_onnx(
     return str(output_path.resolve())
 
 
+def _assert_strip_matches(full: BatesSurrogate, live: torch.nn.Module) -> None:
+    """Refuse to export a strip that is not bit-exact with the checkpoint."""
+    full = full.cpu().eval()
+    live = live.cpu().eval()
+    x = torch.rand(8, full.n_params)
+    with torch.no_grad():
+        delta = (live(x) - full(x)).abs().max().item()
+    if delta != 0.0:
+        raise RuntimeError(
+            f"stripped graph diverges from checkpoint forward (max|Δ|={delta:.3e})"
+        )
+
 # ---------------------------------------------------------------------------
 # Convenience: load checkpoint and export
 # ---------------------------------------------------------------------------
@@ -219,21 +237,29 @@ def load_and_export(
 
     out_dir = Path(out_dir)
 
-    if adapter_path is not None:
-        combined = BatesSurrogateWithPINN.from_checkpoints(
-            checkpoint_path, adapter_path, rank=lora_rank
+    full = BatesSurrogate.from_checkpoint(checkpoint_path)
+    live = strip_dead_gemms(full).eval()
+    n_params = full.n_params
+    if live is not full:
+        _assert_strip_matches(full, live)
+        print(
+            f"[export] stripped collapsed residual GEMMs: "
+            f"{full.n_parameters():,} → {live.n_parameters():,} parameters"
         )
-        combined.eval()
-        # Wrap so export functions see .n_params attribute
-        model = combined
-        n_params = combined.base.n_params
-        print(f"[export] loaded base checkpoint: {checkpoint_path}")
-        print(f"[export] loaded PINN adapter:    {adapter_path}  (rank={lora_rank})")
-        print(f"[export] combined model: {combined.base.n_parameters():,} base + "
-              f"{combined.adapter.n_parameters():,} adapter parameters")
+
+    if adapter_path is not None:
+        adapter = PINNAdapter(n_flat=full.n_outputs, rank=lora_rank)
+        ckpt = torch.load(adapter_path, map_location="cpu", weights_only=True)
+        adapter.load_state_dict(ckpt["adapter_state_dict"])
+        model = BatesSurrogateWithPINN(live, adapter).eval()
+        model.n_params = n_params  # type: ignore[attr-defined]
+        print(f"[export] loaded PINN adapter: {adapter_path}  (rank={lora_rank})")
+        print(
+            f"[export] combined model: {live.n_parameters():,} base + "
+            f"{adapter.n_parameters():,} adapter parameters"
+        )
     else:
-        model = BatesSurrogate.from_checkpoint(checkpoint_path)
-        n_params = model.n_params
+        model = live
         print(f"[export] loaded checkpoint: {checkpoint_path}")
         print(f"[export] model: {model.n_parameters():,} parameters")
 

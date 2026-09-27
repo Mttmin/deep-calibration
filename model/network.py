@@ -16,6 +16,7 @@ single flat linear projection.
 """
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -223,9 +224,11 @@ class BatesSurrogate(nn.Module):
         rank: int = 24,
         dropout: float = 0.10,
         pricable_region: torch.Tensor | None = None,
+        n_aux: int = 5,
     ) -> None:
         super().__init__()
         self.n_params  = n_params
+        self.n_aux     = n_aux
         self.n_outputs = n_outputs
         self.width     = width
         self.n_blocks  = n_blocks
@@ -289,7 +292,7 @@ class BatesSurrogate(nn.Module):
             nn.Linear(width, width // 2),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(width // 2, 5),  # Output 5 Heston parameters
+            nn.Linear(width // 2, n_aux),
             nn.Sigmoid(),  # Normalize to [0, 1]
         )
 
@@ -422,11 +425,124 @@ class BatesSurrogate(nn.Module):
             nt        = cfg.get("nt",        14),
             rank      = cfg.get("rank",      24),
             dropout   = cfg.get("dropout",   0.10),
+            n_aux     = cfg.get("n_aux",     5),
             pricable_region = pricable_region,
         )
         model.load_compatible_state_dict(sd)
         return model
 
+
+# Residual GEMMs in the v2 checkpoint underflowed to ~1e-40. Live Linear
+# weights in that same file are >= 1e-4, so this threshold only fires on
+# collapsed blocks, not on a healthy retrain.
+_COLLAPSED_WEIGHT_MAX = 1e-20
+
+
+def _abs_max(t: torch.Tensor) -> float:
+    if t.numel() == 0:
+        return 0.0
+    return float(t.detach().abs().max().item())
+
+
+def residual_gemms_collapsed(model: BatesSurrogate) -> bool:
+    """True when every residual GEMM weight has underflowed.
+
+    The live signal in that case is ``fc2.bias`` (a constant shift inside
+    ``silu``) plus the residual head's final bias. Stem and grid head stay.
+    """
+    for block in model.blocks:
+        if _abs_max(block.fc1.weight) > _COLLAPSED_WEIGHT_MAX:
+            return False
+        if _abs_max(block.fc2.weight) > _COLLAPSED_WEIGHT_MAX:
+            return False
+        if _abs_max(block.ln.weight) > _COLLAPSED_WEIGHT_MAX:
+            return False
+    for layer in model.residual_head:
+        if isinstance(layer, nn.Linear) and _abs_max(layer.weight) > _COLLAPSED_WEIGHT_MAX:
+            return False
+    return True
+
+
+class LiveSurrogate(nn.Module):
+    """Inference graph with collapsed residual GEMMs removed.
+
+    ``forward`` matches ``BatesSurrogate.forward`` bit-exactly on a collapsed
+    checkpoint. Input and output shapes are unchanged, so the options-pricer
+    ONNX contract (``parameters`` → ``iv_surface``) still holds.
+    ``forward_dual`` is not available: ``param_head`` is unused by inference.
+    """
+
+    def __init__(self, src: BatesSurrogate) -> None:
+        super().__init__()
+        self.n_params = src.n_params
+        self.n_outputs = src.n_outputs
+        self.stem = copy.deepcopy(src.stem)
+        self.grid_head = copy.deepcopy(src.grid_head)
+        self.shifts = nn.ParameterList(
+            [nn.Parameter(block.fc2.bias.detach().clone()) for block in src.blocks]
+        )
+        final = src.residual_head[-1]
+        if not isinstance(final, nn.Linear):
+            raise TypeError("residual_head final layer must be nn.Linear")
+        self.res_bias = nn.Parameter(final.bias.detach().clone())
+        self.register_buffer(
+            "pricable_region",
+            src.pricable_region.detach().clone(),
+            persistent=True,
+        )
+
+    def forward(self, theta: torch.Tensor) -> torch.Tensor:
+        x = self.stem(theta)
+        for shift in self.shifts:
+            x = F.silu(x + shift)
+        raw = self.grid_head(x) + self.res_bias
+        return F.softplus(raw, beta=3) + 0.01
+
+    def forward_with_mask(self, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        iv_pred = self.forward(theta)
+        mask = self.pricable_region.to(dtype=torch.bool, device=iv_pred.device)
+        mask = mask.unsqueeze(0).expand(iv_pred.shape[0], -1)
+        return iv_pred, mask
+
+    def n_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def strip_dead_gemms(model: BatesSurrogate) -> nn.Module:
+    """Return ``LiveSurrogate`` when residual GEMMs collapsed, else ``model``."""
+    if residual_gemms_collapsed(model):
+        return LiveSurrogate(model).eval()
+    return model
+
+
+def load_for_inference(
+    checkpoint_path: str | Path,
+    *,
+    compile: bool = True,
+    device: torch.device | str | None = None,
+) -> nn.Module:
+    """Load a checkpoint for pricing / calibration, not for training.
+
+    Collapsed residual GEMMs are stripped. On CUDA the live graph is
+    ``torch.compile``d. ``reduce-overhead`` is not used: it enables CUDA
+    graphs, which overwrite the previous forward output while L-BFGS still
+    holds it for backward. The compiled object is only a forward wrapper;
+    export and training must use the uncompiled module.
+    """
+    full = BatesSurrogate.from_checkpoint(checkpoint_path)
+    model = strip_dead_gemms(full).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if device is not None:
+        model = model.to(device)
+    if not compile:
+        return model
+    dev = device if isinstance(device, torch.device) else (
+        torch.device(device) if device is not None else next(model.parameters()).device
+    )
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return model
+    return torch.compile(model, mode="default")
 
 # ---------------------------------------------------------------------------
 # PINN LoRA adapter
